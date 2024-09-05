@@ -1,0 +1,14 @@
+[Unit]
+Description=DX cluster spot collector
+After=network.target
+
+[Service]
+Type=simple
+Restart=on-failure
+ExecStart=/usr/bin/python3 /opt/spot-collector/spot-collector.py --server1 s50dxs.s53m.com:8000 --server2 10.0.10.101:7300 --server3 10.0.10.104:7300 --server4 10.0.10.154:7373 --listen-port 8000 --callsign XXXXXX-23 --note1 "S50DXS" --note2 "S53M1 skimmer" --note3 "S53M4 skimmer" --note4 "Flexradio skimmer"
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+
