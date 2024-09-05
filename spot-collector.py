@@ -21,7 +21,7 @@ def parse_arguments():
     parser.add_argument('--server3', type=str, help="Address and port of the third server in the format address:port")
     parser.add_argument('--server4', type=str, help="Address and port of the fourth server in the format address:port")
     parser.add_argument('--listen-port', type=int, required=True, help="Port on which the relay listens for incoming connections")
-    parser.add_argument('--callsign', type=str, required=True, help="Callsign to send when 'call:' or 'login:' is received. The full callsign is sent to the first server; a modified version without the suffix is sent to others.")
+    parser.add_argument('--callsign', type=str, required=True, help="Callsign to send when 'call:' or 'login:' is received. The full callsign is sent to the first server (e.g., S53M-23); a modified version without the suffix is sent to others (e.g., S53M).")
     parser.add_argument('--note1', type=str, help="Note for the first server")
     parser.add_argument('--note2', type=str, help="Note for the second server")
     parser.add_argument('--note3', type=str, help="Note for the third server")
@@ -63,57 +63,57 @@ class TelnetRelay:
                 await asyncio.sleep(RECONNECT_INTERVAL)
 
     async def handle_client(self, reader, writer):
-    client_address = writer.get_extra_info('peername')
-    logging.debug(f'New client connection from {client_address}')
-    self.client_writers.append(writer)
-    try:
-        while True:
-            data = await reader.read(100)
-            if not data:
-                logging.debug(f'No more data from client {client_address}')
-                break
-            try:
-                message = data.decode('utf-8').strip()
-                logging.debug(f'Received data from client {client_address}: {message}')
+        client_address = writer.get_extra_info('peername')
+        logging.debug(f'New client connection from {client_address}')
+        self.client_writers.append(writer)
+        try:
+            while True:
+                data = await reader.read(100)
+                if not data:
+                    logging.debug(f'No more data from client {client_address}')
+                    break
+                try:
+                    message = data.decode('utf-8').strip()
+                    logging.debug(f'Received data from client {client_address}: {message}')
 
-                if message.lower() == "status":
-                    logging.debug(f'Received "status" command from client {client_address}, sending server status')
-                    await self.send_status_to_single_client(writer)
-                    continue
+                    if message.lower() == "status":
+                        logging.debug(f'Received "status" command from client {client_address}, sending server status')
+                        await self.send_status_to_single_client(writer)
+                        continue
 
-                if message.lower() == "connect":
-                    logging.debug(f'Received "connect" command from client {client_address}, reconnecting to all servers')
-                    await self.connect_to_all_servers()
-                    continue
+                    if message.lower() == "connect":
+                        logging.debug(f'Received "connect" command from client {client_address}, reconnecting to all servers')
+                        await self.connect_to_all_servers()
+                        continue
 
-                if message.lower() == "list clients":
-                    logging.debug(f'Received "list clients" command from client {client_address}, sending list of connected clients')
-                    await self.list_connected_clients(writer)
-                    continue
+                    if message.lower() == "list":
+                        logging.debug(f'Received "list" command from client {client_address}, sending list of connected clients')
+                        await self.list_connected_clients(writer)
+                        continue
 
-                if message.lower() == "uptime":
-                    logging.debug(f'Received "uptime" command from client {client_address}, sending server uptime')
-                    await self.send_uptime(writer)
-                    continue
+                    if message.lower() == "uptime":
+                        logging.debug(f'Received "uptime" command from client {client_address}, sending server uptime')
+                        await self.send_uptime(writer)
+                        continue
 
-                server1_writer = self.server_connections.get('Server1', (None, None, None))[1]
-                if server1_writer:
-                    server1_writer.write(data)
-                    await server1_writer.drain()
-                    logging.debug(f'Relayed data from client {client_address} to server1')
+                    server1_writer = self.server_connections.get('Server1', (None, None, None))[1]
+                    if server1_writer:
+                        server1_writer.write(data)
+                        await server1_writer.drain()
+                        logging.debug(f'Relayed data from client {client_address} to server1')
 
-            except UnicodeDecodeError as e:
-                logging.error(f'Failed to decode data from client {client_address}: {e}')
-                # Optionally: close the connection or ignore the message
-                break
+                except UnicodeDecodeError as e:
+                    logging.error(f'Failed to decode data from client {client_address}: {e}')
+                    # Optionally: close the connection or ignore the message
+                    break
 
-    except (ConnectionResetError, BrokenPipeError) as e:
-        logging.error(f'Connection to client {client_address} lost: {e}')
-    finally:
-        logging.debug(f'Closing client connection {client_address}')
-        self.client_writers.remove(writer)
-        writer.close()
-        await writer.wait_closed()
+        except (ConnectionResetError, BrokenPipeError) as e:
+            logging.error(f'Connection to client {client_address} lost: {e}')
+        finally:
+            logging.debug(f'Closing client connection {client_address}')
+            self.client_writers.remove(writer)
+            writer.close()
+            await writer.wait_closed()
 
     async def list_connected_clients(self, writer):
         """
