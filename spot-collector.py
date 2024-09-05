@@ -63,16 +63,17 @@ class TelnetRelay:
                 await asyncio.sleep(RECONNECT_INTERVAL)
 
     async def handle_client(self, reader, writer):
-        client_address = writer.get_extra_info('peername')
-        logging.debug(f'New client connection from {client_address}')
-        self.client_writers.append(writer)
-        try:
-            while True:
-                data = await reader.read(100)
-                if not data:
-                    logging.debug(f'No more data from client {client_address}')
-                    break
-                message = data.decode().strip()
+    client_address = writer.get_extra_info('peername')
+    logging.debug(f'New client connection from {client_address}')
+    self.client_writers.append(writer)
+    try:
+        while True:
+            data = await reader.read(100)
+            if not data:
+                logging.debug(f'No more data from client {client_address}')
+                break
+            try:
+                message = data.decode('utf-8').strip()
                 logging.debug(f'Received data from client {client_address}: {message}')
 
                 if message.lower() == "status":
@@ -85,8 +86,8 @@ class TelnetRelay:
                     await self.connect_to_all_servers()
                     continue
 
-                if message.lower() == "list":
-                    logging.debug(f'Received "list" command from client {client_address}, sending list of connected clients')
+                if message.lower() == "list clients":
+                    logging.debug(f'Received "list clients" command from client {client_address}, sending list of connected clients')
                     await self.list_connected_clients(writer)
                     continue
 
@@ -100,13 +101,19 @@ class TelnetRelay:
                     server1_writer.write(data)
                     await server1_writer.drain()
                     logging.debug(f'Relayed data from client {client_address} to server1')
-        except (ConnectionResetError, BrokenPipeError) as e:
-            logging.error(f'Connection to client {client_address} lost: {e}')
-        finally:
-            logging.debug(f'Closing client connection {client_address}')
-            self.client_writers.remove(writer)
-            writer.close()
-            await writer.wait_closed()
+
+            except UnicodeDecodeError as e:
+                logging.error(f'Failed to decode data from client {client_address}: {e}')
+                # Optionally: close the connection or ignore the message
+                break
+
+    except (ConnectionResetError, BrokenPipeError) as e:
+        logging.error(f'Connection to client {client_address} lost: {e}')
+    finally:
+        logging.debug(f'Closing client connection {client_address}')
+        self.client_writers.remove(writer)
+        writer.close()
+        await writer.wait_closed()
 
     async def list_connected_clients(self, writer):
         """
