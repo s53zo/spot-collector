@@ -2,6 +2,7 @@ import asyncio
 import logging
 import argparse
 import re
+import time
 
 RECONNECT_INTERVAL = 300  # 5 minutes
 STATUS_INTERVAL = 300  # 5 minutes
@@ -12,15 +13,15 @@ def parse_arguments():
         description="Telnet Relay Script for relaying data between multiple Telnet servers and clients.\n"
                     "This script connects to multiple Telnet servers and relays data from clients to these servers. "
                     "The first server receives the full callsign as provided, while other servers receive a modified "
-                    "callsign without the suffix (e.g., '-23'). The script also handles 'status' and 'connect' commands "
-                    "from clients to display connection status or reconnect to servers."
+                    "callsign without the suffix (e.g., '-23'). The script also handles 'status', 'connect', 'list', "
+                    "and 'uptime' commands from clients to manage connections and display information."
     )
     parser.add_argument('--server1', type=str, required=True, help="Address and port of the first server in the format address:port. Data from clients will be relayed only to this server.")
     parser.add_argument('--server2', type=str, required=True, help="Address and port of the second server in the format address:port")
     parser.add_argument('--server3', type=str, help="Address and port of the third server in the format address:port")
     parser.add_argument('--server4', type=str, help="Address and port of the fourth server in the format address:port")
     parser.add_argument('--listen-port', type=int, required=True, help="Port on which the relay listens for incoming connections")
-    parser.add_argument('--callsign', type=str, required=True, help="Callsign to send when 'call:' or 'login:' is received. The full callsign is sent to the first server (e.g. S53M-23); a modified version without the suffix is sent to others. (e.g. S53M)")
+    parser.add_argument('--callsign', type=str, required=True, help="Callsign to send when 'call:' or 'login:' is received. The full callsign is sent to the first server; a modified version without the suffix is sent to others.")
     parser.add_argument('--note1', type=str, help="Note for the first server")
     parser.add_argument('--note2', type=str, help="Note for the second server")
     parser.add_argument('--note3', type=str, help="Note for the third server")
@@ -44,6 +45,7 @@ class TelnetRelay:
         self.callsign = callsign
         self.client_writers = []
         self.server_connections = {}  # Use a dictionary to store server connections
+        self.start_time = time.time()  # Track when the server started
         logging.debug(f'TelnetRelay initialized with servers: {servers}, listen_port: {listen_port}, callsign: {callsign}, notes: {notes}')
 
     async def connect_to_server(self, address, port, server_name):
@@ -83,6 +85,16 @@ class TelnetRelay:
                     await self.connect_to_all_servers()
                     continue
 
+                if message.lower() == "list":
+                    logging.debug(f'Received "list" command from client {client_address}, sending list of connected clients')
+                    await self.list_connected_clients(writer)
+                    continue
+
+                if message.lower() == "uptime":
+                    logging.debug(f'Received "uptime" command from client {client_address}, sending server uptime')
+                    await self.send_uptime(writer)
+                    continue
+
                 server1_writer = self.server_connections.get('Server1', (None, None, None))[1]
                 if server1_writer:
                     server1_writer.write(data)
@@ -95,6 +107,24 @@ class TelnetRelay:
             self.client_writers.remove(writer)
             writer.close()
             await writer.wait_closed()
+
+    async def list_connected_clients(self, writer):
+        """
+        List all currently connected clients.
+        """
+        clients = "\n".join([str(writer.get_extra_info('peername')) for writer in self.client_writers])
+        status_message = f"Connected clients:\n{clients}\n"
+        writer.write(status_message.encode())
+        await writer.drain()
+
+    async def send_uptime(self, writer):
+        """
+        Send the uptime of the relay server.
+        """
+        uptime_seconds = time.time() - self.start_time
+        uptime_message = f"Server Uptime: {uptime_seconds:.2f} seconds\n"
+        writer.write(uptime_message.encode())
+        await writer.drain()
 
     async def send_status_to_single_client(self, writer):
         """
@@ -153,7 +183,7 @@ class TelnetRelay:
                 logging.error(f'Connection to server {server_name} lost: {e}')
         finally:
             logging.debug(f'Closing connection to server {server_name}')
-            writer.close()  # Properly close the writer
+            writer.close()
             await writer.wait_closed()
             await self.reconnect_to_server(server_name)
 
