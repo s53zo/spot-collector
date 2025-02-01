@@ -1,7 +1,61 @@
-# spot-collector
-Connect to different dx-clusters and merges them into one service. Similar to wintelnetx.
+# Spot Collector
 
-I use it to connect to DXCLUSTER such as S50DXS at cluster.s53m.com on 8000 and to local skimmer servers
-to merge all the spots comming to my logging software.
+**Spot Collector** is a lightweight Python-based Telnet relay tool designed to connect to multiple DX cluster servers and merge their data streams into a single output. It is ideal for consolidating spots from various clusters into one logging service—similar in spirit to wintelnetx.
 
-I start the script with SystemD using the provide .service file.
+## Overview
+
+Spot Collector connects to up to four Telnet servers (DX clusters) concurrently. It listens for incoming client connections and relays messages between clients and the configured Telnet servers. The script supports a number of built-in commands (such as `status`, `connect`, `list`, and `uptime`) to help you monitor and control its behavior.
+
+When the script receives specific prompts (e.g., “call:”, “sign:”, or “login”), it sends the appropriate callsign:
+- **Server1** receives the full callsign (e.g., `S53M-23`).
+- **Other servers** receive a modified callsign with any trailing numeric suffix removed (e.g., `S53M`).
+
+## Features
+
+- **Multi-Server Connectivity:** Connect to up to four DX cluster servers simultaneously.
+- **Automatic Reconnection:** Automatically attempts to reconnect if a server connection is lost.
+- **Client Commands:** Supports commands for checking status, reconnecting servers, listing connected clients, and viewing uptime.
+- **Customizable Callsign:** Sends a full callsign to the primary server while stripping the numeric suffix for secondary servers.
+- **SystemD Integration:** Easily run as a background service using the provided SystemD unit file.
+
+## Requirements
+
+- **Python 3.7+** – The script uses Python's `asyncio` library and standard modules.
+- **SystemD** (optional) – To use the provided service file for running Spot Collector as a service on Unix-like systems.
+
+## Installation
+
+1. **Clone the Repository:**
+
+   ```bash
+   git clone https://github.com/s53zo/spot-collector.git
+   cd spot-collector
+
+2. **(Optional) Set Up a Virtual Environment:**
+
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+
+Dependencies:
+This project relies only on Python’s standard library modules. No additional packages are required.
+Usage
+
+Usage
+
+Command-Line Arguments
+Run the script using the following required arguments:
+
+```bash
+    --server1: Address and port of the primary DX cluster server (e.g., s50dxs.s53m.com:8000).
+    --server2: Address and port of the secondary DX cluster server.
+    --listen-port: Port on which the relay listens for incoming connections.
+    --callsign: Callsign to be sent. The primary server gets the full callsign (e.g., S53M-23), while other servers get the base callsign (e.g., S53M).
+
+    Additional optional arguments include:
+
+    --server3 and --server4: Addresses and ports for additional servers.
+    --note1, --note2, --note3, --note4: Descriptive notes for each server.
+    --debug: Enable debug logging for troubleshooting.
+
+ 
