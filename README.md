@@ -46,7 +46,7 @@ Usage
 Command-Line Arguments
 Run the script using the following required arguments:
 
-```bash
+   ```bash
     --server1: Address and port of the primary DX cluster server (e.g., s50dxs.s53m.com:8000).
     --server2: Address and port of the secondary DX cluster server.
     --listen-port: Port on which the relay listens for incoming connections.
@@ -57,5 +57,19 @@ Run the script using the following required arguments:
     --server3 and --server4: Addresses and ports for additional servers.
     --note1, --note2, --note3, --note4: Descriptive notes for each server.
     --debug: Enable debug logging for troubleshooting.
+
+Example command:
+   python3 spot-collector.py \
+     --server1 s50dxs.s53m.com:8000 \
+     --server2 10.0.10.101:7300 \
+     --server3 10.0.10.104:7300 \
+     --server4 10.0.10.154:7373 \
+     --listen-port 8000 \
+     --callsign S53M-23 \
+     --note1 "S50DXS" \
+     --note2 "Local Skimmer 1" \
+     --note3 "Local Skimmer 2" \
+     --note4 "Flexradio Skimmer"
+
 
  
