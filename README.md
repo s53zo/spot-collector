@@ -7,7 +7,7 @@
 Spot Collector connects to up to four Telnet servers (DX clusters) concurrently. It listens for incoming client connections and relays messages between clients and the configured Telnet servers. The script supports a number of built-in commands (such as `status`, `connect`, `list`, and `uptime`) to help you monitor and control its behavior.
 
 When the script receives specific prompts (e.g., “call:”, “sign:”, or “login”), it sends the appropriate callsign:
-- **Server1** receives the full callsign (e.g., `S53M-23`).
+- **Server1** receives the full callsign (e.g., `S53M-23`). The 1st server will also receive all user input, e.g. sh/dx, sh/u, dx 14230 S55OO No ears etc.
 - **Other servers** receive a modified callsign with any trailing numeric suffix removed (e.g., `S53M`).
 
 ## Features
