@@ -37,10 +37,6 @@ When the script receives specific prompts (e.g., “call:”, “sign:”, or �
     python3 -m venv venv
     source venv/bin/activate
 
-Dependencies:
-This project relies only on Python’s standard library modules. No additional packages are required.
-
-
 3. **Command-Line Arguments**
 Run the script using the following required arguments:
 
