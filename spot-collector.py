@@ -16,7 +16,7 @@ def parse_arguments():
                     "callsign without the suffix (e.g., '-23'). The script also handles 'status', 'connect', 'list', "
                     "and 'uptime' commands from clients to manage connections and display information."
     )
-    parser.add_argument('--server1', type=str, required=True, help="Address and port of the first server in the format address:port. Data from clients will be relayed only to this server.")
+    parser.add_argument('--server1', type=str, required=True, help="Address and port of the first server in the format address:port. Data from clients will be relayed only to this server. (for example local DX 14001 S53ZO CQing)")
     parser.add_argument('--server2', type=str, required=True, help="Address and port of the second server in the format address:port")
     parser.add_argument('--server3', type=str, help="Address and port of the third server in the format address:port")
     parser.add_argument('--server4', type=str, help="Address and port of the fourth server in the format address:port")
