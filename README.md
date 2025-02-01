@@ -39,11 +39,9 @@ When the script receives specific prompts (e.g., “call:”, “sign:”, or �
 
 Dependencies:
 This project relies only on Python’s standard library modules. No additional packages are required.
-Usage
 
-Usage
 
-Command-Line Arguments
+3. **Command-Line Arguments**
 Run the script using the following required arguments:
 
    ```bash
@@ -58,7 +56,8 @@ Run the script using the following required arguments:
     --note1, --note2, --note3, --note4: Descriptive notes for each server.
     --debug: Enable debug logging for troubleshooting.
 
-Example command:
+4. **Example command:**
+   ```bash
    python3 spot-collector.py \
      --server1 s50dxs.s53m.com:8000 \
      --server2 10.0.10.101:7300 \
