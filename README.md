@@ -51,6 +51,7 @@ Run the script using the following required arguments:
     --server3 and --server4: Addresses and ports for additional servers.
     --note1, --note2, --note3, --note4: Descriptive notes for each server.
     --debug: Enable debug logging for troubleshooting.
+    --login-prompt "callsign: ": Send this prompt to the client. Some SW needs this to establish the connection.
 
 4. **Example command:**
    ```bash
@@ -64,7 +65,8 @@ Run the script using the following required arguments:
      --note1 "S50DXS" \
      --note2 "Local Skimmer 1" \
      --note3 "Local Skimmer 2" \
-     --note4 "Flexradio Skimmer"
+     --note4 "Flexradio Skimmer" \
+     --login-prompt "login: "
 
 
  
