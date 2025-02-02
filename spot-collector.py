@@ -27,6 +27,7 @@ def parse_arguments():
     parser.add_argument('--note3', type=str, help="Note for the third server")
     parser.add_argument('--note4', type=str, help="Note for the fourth server")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
+    parser.add_argument('--login-prompt', type=str, default="login: ", help="Login prompt to send to clients upon connection (default: 'login: ')")
 
     return parser.parse_args()
 
@@ -38,15 +39,17 @@ def strip_callsign_suffix(callsign):
     return re.sub(r'-\d+$', '', callsign)
 
 class TelnetRelay:
-    def __init__(self, servers, notes, listen_port, callsign):
+    def __init__(self, servers, notes, listen_port, callsign, login_prompt):
         self.servers = servers
         self.notes = notes
         self.listen_port = listen_port
         self.callsign = callsign
+        self.login_prompt = login_prompt
         self.client_writers = []
         self.server_connections = {}  # Use a dictionary to store server connections
         self.start_time = time.time()  # Track when the server started
-        logging.debug(f'TelnetRelay initialized with servers: {servers}, listen_port: {listen_port}, callsign: {callsign}, notes: {notes}')
+        logging.debug(f'TelnetRelay initialized with servers: {servers}, listen_port: {listen_port}, '
+                     f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}')
 
     async def connect_to_server(self, address, port, server_name):
         logging.debug(f'Connecting to server {address}:{port}')
@@ -66,7 +69,13 @@ class TelnetRelay:
         client_address = writer.get_extra_info('peername')
         logging.debug(f'New client connection from {client_address}')
         self.client_writers.append(writer)
+        
         try:
+            # Send login prompt immediately after connection
+            writer.write(self.login_prompt.encode())
+            await writer.drain()
+            logging.debug(f'Sent login prompt to client {client_address}')
+
             while True:
                 data = await reader.read(100)
                 if not data:
@@ -104,7 +113,6 @@ class TelnetRelay:
 
                 except UnicodeDecodeError as e:
                     logging.error(f'Failed to decode data from client {client_address}: {e}')
-                    # Optionally: close the connection or ignore the message
                     break
 
         except (ConnectionResetError, BrokenPipeError) as e:
@@ -251,5 +259,5 @@ if __name__ == "__main__":
         'Server4': args.note4 or ''
     }
 
-    relay = TelnetRelay(servers, notes, args.listen_port, args.callsign)
+    relay = TelnetRelay(servers, notes, args.listen_port, args.callsign, args.login_prompt)
     asyncio.run(relay.start_relay())
