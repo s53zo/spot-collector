@@ -176,6 +176,9 @@ class TelnetRelay:
                 if b"call" in data or b"sign:" in data or b"login" in data:
                     logging.debug(f'Received "call:" or "callsign:" or "login:" from {server_name}, sending response to servers')
 
+                    #add 2 second delay
+                    await asyncio.sleep(2)
+                    
                     # Determine which callsign to send based on the server
                     if server_name == 'Server1':
                         response = f"{self.callsign}\r\n".encode()  # Send full callsign to the first server
