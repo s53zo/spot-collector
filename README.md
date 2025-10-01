@@ -52,6 +52,12 @@ Run the script using the following required arguments:
     --note1, --note2, --note3, --note4: Descriptive notes for each server.
     --debug: Enable debug logging for troubleshooting.
     --login-prompt "callsign: ": Send this prompt to the client. Some SW needs this to establish the connection.
+    --client-timeout: Inactivity timeout (seconds) for downstream client sessions; 0 keeps listeners attached indefinitely.
+    --server-timeout: Inactivity timeout (seconds) for upstream DX cluster links; 0 relies on TCP keepalive to detect failures.
+
+   ```
+
+   TCP keepalive is enabled automatically for both upstream and downstream sockets to surface silent disconnects without forcing idle listeners to drop.
 
 4. **Example command:**
    ```bash
@@ -67,6 +73,8 @@ Run the script using the following required arguments:
      --note3 "Local Skimmer 2" \
      --note4 "Flexradio Skimmer" \
      --login-prompt "login: "
+
+   ```
 
 
  

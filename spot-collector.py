@@ -1,12 +1,12 @@
+import argparse
 import asyncio
 import logging
-import argparse
 import re
+import socket
 import time
 
 RECONNECT_INTERVAL = 300  # 5 minutes max delay for reconnect attempts
 STATUS_INTERVAL = 300     # 5 minutes between status updates
-INACTIVITY_TIMEOUT = 300  # 5 minutes timeout for inactivity
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -28,6 +28,10 @@ def parse_arguments():
     parser.add_argument('--note4', type=str, help="Note for the fourth server")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
     parser.add_argument('--login-prompt', type=str, default="login: ", help="Login prompt to send to clients upon connection (default: 'login: ')")
+    parser.add_argument('--client-timeout', type=int, default=0,
+                        help="Optional inactivity timeout (seconds) for client connections; 0 disables the timeout")
+    parser.add_argument('--server-timeout', type=int, default=0,
+                        help="Optional inactivity timeout (seconds) for upstream server connections; 0 disables the timeout")
 
     return parser.parse_args()
 
@@ -39,7 +43,7 @@ def strip_callsign_suffix(callsign):
     return re.sub(r'-\d+$', '', callsign)
 
 class TelnetRelay:
-    def __init__(self, servers, notes, listen_port, callsign, login_prompt):
+    def __init__(self, servers, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None):
         self.servers = servers
         self.notes = notes
         self.listen_port = listen_port
@@ -48,8 +52,36 @@ class TelnetRelay:
         self.client_writers = []
         self.server_connections = {}  # server_name: (reader, writer, address, alive)
         self.start_time = time.time()  # Track when the server started
+        self.client_timeout = client_timeout
+        self.server_timeout = server_timeout
         logging.debug(f'TelnetRelay initialized with servers: {servers}, listen_port: {listen_port}, '
-                      f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}')
+                      f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}, '
+                      f'client_timeout: {client_timeout}, server_timeout: {server_timeout}')
+
+    def _enable_tcp_keepalive(self, writer, context):
+        """Enable TCP keepalive on the provided writer's socket when possible."""
+        sock = writer.get_extra_info('socket')
+        if sock is None:
+            logging.debug(f'No socket to configure keepalive for {context}')
+            return
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            elif hasattr(socket, 'TCP_KEEPALIVE'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60)
+
+            if hasattr(socket, 'TCP_KEEPINTVL'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
+
+            if hasattr(socket, 'TCP_KEEPCNT'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
+
+            logging.debug(f'Enabled TCP keepalive for {context}')
+        except OSError as e:
+            logging.debug(f'Failed to enable TCP keepalive for {context}: {e}')
 
     async def connect_to_server(self, address, port, server_name):
         """Connect to a server with exponential backoff on failure."""
@@ -60,6 +92,7 @@ class TelnetRelay:
                 reader, writer = await asyncio.open_connection(address, port)
                 logging.debug(f'Connected to server {address}:{port}')
                 self.server_connections[server_name] = (reader, writer, f'{address}:{port}', True)
+                self._enable_tcp_keepalive(writer, f'server connection {server_name}')
                 asyncio.create_task(self.relay_server_data(reader, writer, server_name))
                 return
             except Exception as e:
@@ -73,6 +106,7 @@ class TelnetRelay:
         client_address = writer.get_extra_info('peername')
         logging.debug(f'New client connection from {client_address}')
         self.client_writers.append(writer)
+        self._enable_tcp_keepalive(writer, f'client {client_address}')
         
         try:
             writer.write(self.login_prompt.encode())
@@ -81,7 +115,10 @@ class TelnetRelay:
 
             while True:
                 try:
-                    data = await asyncio.wait_for(reader.read(1024), timeout=INACTIVITY_TIMEOUT)
+                    if self.client_timeout:
+                        data = await asyncio.wait_for(reader.read(1024), timeout=self.client_timeout)
+                    else:
+                        data = await reader.read(1024)
                     if not data:
                         logging.debug(f'No more data from client {client_address}')
                         break
@@ -115,7 +152,7 @@ class TelnetRelay:
                         logging.debug(f'Relayed data from client {client_address} to server1')
 
                 except asyncio.TimeoutError:
-                    logging.debug(f'Client {client_address} inactive for {INACTIVITY_TIMEOUT} seconds')
+                    logging.debug(f'Client {client_address} inactive for {self.client_timeout} seconds')
                     break
                 except UnicodeDecodeError as e:
                     logging.error(f'Failed to decode data from client {client_address}: {e}')
@@ -166,7 +203,10 @@ class TelnetRelay:
         """Relay data from server to clients and handle server responses."""
         try:
             while True:
-                data = await asyncio.wait_for(reader.read(1024), timeout=INACTIVITY_TIMEOUT)
+                if self.server_timeout:
+                    data = await asyncio.wait_for(reader.read(1024), timeout=self.server_timeout)
+                else:
+                    data = await reader.read(1024)
                 if not data:
                     logging.debug(f'No more data from server {server_name}')
                     break
@@ -187,10 +227,10 @@ class TelnetRelay:
                     if not client_writer.is_closing():
                         client_writer.write(data)
                         await client_writer.drain()
-                        logging.debug(f'Relayed data from server {server_name} to client}')
+                        logging.debug(f'Relayed data from server {server_name} to client')
 
         except asyncio.TimeoutError:
-            logging.error(f'No data from {server_name} for {INACTIVITY_TIMEOUT} seconds, reconnecting...')
+            logging.error(f'No data from {server_name} for {self.server_timeout} seconds, reconnecting...')
         except (ConnectionResetError, BrokenPipeError) as e:
             logging.error(f'Connection to server {server_name} lost: {e}')
         finally:
@@ -260,5 +300,9 @@ if __name__ == "__main__":
         'Server4': args.note4 or ''
     }
 
-    relay = TelnetRelay(servers, notes, args.listen_port, args.callsign, args.login_prompt)
+    client_timeout = args.client_timeout if args.client_timeout > 0 else None
+    server_timeout = args.server_timeout if args.server_timeout > 0 else None
+
+    relay = TelnetRelay(servers, notes, args.listen_port, args.callsign, args.login_prompt,
+                        client_timeout=client_timeout, server_timeout=server_timeout)
     asyncio.run(relay.start_relay())
