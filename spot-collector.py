@@ -615,7 +615,7 @@ class TelnetRelay:
                 self._record_server_message(server_name)
 
                 lower_chunk = data.lower()
-                prompt_match = re.search(rb'(?:^|\r?\n)\s*(call|callsign|login)\s*:?', lower_chunk)
+                prompt_match = re.search(rb'(call|callsign|login)\s*:?', lower_chunk)
                 if prompt_match and not self.handshake_sent.get(server_name):
                     logging.debug(f'Received login prompt from {server_name}, sending callsign once')
                     await asyncio.sleep(2)  # 2-second delay for login response
