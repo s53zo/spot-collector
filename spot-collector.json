@@ -4,7 +4,7 @@
   "login_prompt": "login: ",
   "client_timeout": 0,
   "server_timeout": 0,
-  "debug": true,
+  "debug": false,
   "servers": [
     {
       "name": "Server1",
@@ -15,18 +15,18 @@
     {
       "name": "Server2",
       "address": "192.168.1.44:7300",
-      "note": "S53M1 skimmer",
+      "note": "1 skimmer",
       "direction": "in"
     },
     {
       "name": "Server3",
       "address": "192.168.1.43:7300",
-      "note": "S53M4 skimmer",
+      "note": "2 skimmer",
       "direction": "in"
     },
     {
       "name": "Server4",
-      "address": "192.168.1.:7300",
+      "address": "192.168.145.:7300",
       "note": "Flexradio skimmer",
       "direction": "in"
     }
