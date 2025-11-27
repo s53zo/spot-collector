@@ -50,10 +50,12 @@ Run the script using the following required arguments:
 
     --server3 and --server4: Addresses and ports for additional servers.
     --note1, --note2, --note3, --note4: Descriptive notes for each server.
-    --debug: Enable debug logging for troubleshooting.
+    --server1-direction/--server2-direction/--server3-direction/--server4-direction: Direction of message flow for each server (`in`, `out`, or `both`). Defaults: server1=`both`, others=`in`.
+    --debug: Enable debug logging for troubleshooting (includes console traffic traces).
     --login-prompt "callsign: ": Send this prompt to the client. Some SW needs this to establish the connection.
     --client-timeout: Inactivity timeout (seconds) for downstream client sessions; 0 keeps listeners attached indefinitely.
     --server-timeout: Inactivity timeout (seconds) for upstream DX cluster links; 0 relies on TCP keepalive to detect failures.
+    --config /path/to/spot-collector.json: Load all arguments from a JSON config file and ignore other CLI flags. Prefer the JSON `servers` array when you want more than four servers.
 
    ```
 
@@ -75,6 +77,49 @@ Run the script using the following required arguments:
      --login-prompt "login: "
 
    ```
+
+5. **Using a JSON config file (supports any number of servers):**
+   ```json
+   {
+     "listen_port": 8000,
+     "callsign": "S53M-23",
+     "login_prompt": "login: ",
+     "client_timeout": 0,
+     "server_timeout": 0,
+     "debug": false,
+     "servers": [
+       {
+         "name": "Primary DX",
+         "address": "s50dxs.s53m.com:8000",
+         "note": "S50DXS",
+         "direction": "both"
+       },
+       {
+         "name": "Skimmer 1",
+         "address": "10.0.10.101:7300",
+         "note": "Local Skimmer 1",
+         "direction": "in"
+       },
+       {
+         "name": "Skimmer 2",
+         "address": "10.0.10.104:7300",
+         "note": "Local Skimmer 2",
+         "direction": "in"
+       },
+       {
+         "name": "Flexradio",
+         "address": "10.0.10.154:7373",
+         "note": "Flexradio Skimmer",
+         "direction": "in"
+       }
+     ]
+   }
+   ```
+   Start the relay with `python3 spot-collector.py --config /path/to/spot-collector.json`. When `--config` is provided, other CLI flags are ignored and required values (`servers`, `listen_port`, `callsign`) must be present in the JSON.
+   - The first server in the `servers` list receives the full callsign; all others receive the base callsign (suffix stripped).
+   - `direction=in` forwards data from that server to all clients only.
+   - `direction=out` forwards data from clients to that server only.
+   - `direction=both` enables bidirectional forwarding.
 
 
  
