@@ -69,6 +69,10 @@ def parse_arguments():
         if not isinstance(config_data, dict):
             parser.error(f'Config file {config_args.config} must contain a JSON object.')
 
+        servers_config_list = None
+        if 'servers' in config_data:
+            servers_config_list = config_data.pop('servers')
+
         for key, value in config_data.items():
             if not hasattr(defaults, key):
                 parser.error(f'Unknown configuration key: {key}')
@@ -76,10 +80,18 @@ def parse_arguments():
                 value = value.lower()
             setattr(defaults, key, value)
 
-        required_fields = ['server1', 'server2', 'listen_port', 'callsign']
-        for field in required_fields:
-            if getattr(defaults, field) in (None, ''):
-                parser.error(f'Missing required configuration value: {field}')
+        if servers_config_list is not None:
+            if not isinstance(servers_config_list, list) or not servers_config_list:
+                parser.error('Config file must provide a non-empty "servers" list.')
+            for required_value, required_name in ((defaults.listen_port, 'listen_port'),
+                                                 (defaults.callsign, 'callsign')):
+                if required_value in (None, ''):
+                    parser.error(f'Missing required configuration value: {required_name}')
+        else:
+            required_fields = ['server1', 'server2', 'listen_port', 'callsign']
+            for field in required_fields:
+                if getattr(defaults, field) in (None, ''):
+                    parser.error(f'Missing required configuration value: {field}')
 
         valid_directions = {'in', 'out', 'both'}
         for name in ['server1_direction', 'server2_direction', 'server3_direction', 'server4_direction']:
@@ -89,11 +101,13 @@ def parse_arguments():
                              f'Use one of {", ".join(sorted(valid_directions))}.')
 
         defaults.config = config_args.config
+        defaults.servers_config_list = servers_config_list
         return defaults
 
     parser = _create_parser(require_required_flags=True)
     args = parser.parse_args()
     args.config = None
+    args.servers_config_list = None
     return args
 
 def strip_callsign_suffix(callsign):
@@ -103,9 +117,62 @@ def strip_callsign_suffix(callsign):
     """
     return re.sub(r'-\d+$', '', callsign)
 
+def _normalize_direction(direction, default_value):
+    if direction is None:
+        return default_value
+    direction = str(direction).lower()
+    if direction not in ('in', 'out', 'both'):
+        raise ValueError(f'Invalid direction "{direction}". Use one of in/out/both.')
+    return direction
+
+def build_server_definitions(args):
+    """
+    Build a list of server definitions that can grow beyond the legacy 4-slot layout.
+    Each definition is a dict with keys: name, address, note, direction.
+    """
+    server_definitions = []
+
+    if args.servers_config_list is not None:
+        for idx, entry in enumerate(args.servers_config_list):
+            if not isinstance(entry, dict):
+                raise ValueError('Each entry in "servers" must be an object with address and optional name/note/direction.')
+            address = entry.get('address')
+            if not address:
+                raise ValueError('Each server entry in "servers" must include an "address".')
+            name = entry.get('name') or f'Server{idx + 1}'
+            note = entry.get('note', '')
+            default_direction = 'both' if idx == 0 else 'in'
+            direction = _normalize_direction(entry.get('direction'), default_direction)
+            server_definitions.append({
+                'name': name,
+                'address': address,
+                'note': note,
+                'direction': direction
+            })
+    else:
+        legacy_servers = [
+            ('Server1', args.server1, args.note1, args.server1_direction, 'both'),
+            ('Server2', args.server2, args.note2, args.server2_direction, 'in'),
+            ('Server3', args.server3, args.note3, args.server3_direction, 'in'),
+            ('Server4', args.server4, args.note4, args.server4_direction, 'in')
+        ]
+        for name, address, note, direction, default_direction in legacy_servers:
+            if address:
+                server_definitions.append({
+                    'name': name,
+                    'address': address,
+                    'note': note or '',
+                    'direction': _normalize_direction(direction, default_direction)
+                })
+
+    if not server_definitions:
+        raise ValueError('At least one server must be configured.')
+
+    return server_definitions
+
 class TelnetRelay:
-    def __init__(self, servers, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None, server_directions=None):
-        self.servers = servers
+    def __init__(self, server_definitions, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None, server_directions=None):
+        self.server_definitions = server_definitions
         self.notes = notes
         self.listen_port = listen_port
         self.callsign = callsign
@@ -116,7 +183,8 @@ class TelnetRelay:
         self.client_timeout = client_timeout
         self.server_timeout = server_timeout
         self.server_directions = server_directions or {}
-        logging.debug(f'TelnetRelay initialized with servers: {servers}, listen_port: {listen_port}, '
+        self.primary_server_name = self.server_definitions[0]['name']
+        logging.debug(f'TelnetRelay initialized with servers: {self.server_definitions}, listen_port: {listen_port}, '
                       f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}, '
                       f'client_timeout: {client_timeout}, server_timeout: {server_timeout}, '
                       f'server_directions: {self.server_directions}')
@@ -128,6 +196,16 @@ class TelnetRelay:
     def _direction_allows_inbound(self, server_name):
         direction = self.server_directions.get(server_name, 'both')
         return direction in ('in', 'both')
+
+    def _iter_server_status(self):
+        for server_def in self.server_definitions:
+            name = server_def['name']
+            connection = self.server_connections.get(name)
+            address = connection[2] if connection else server_def['address']
+            alive = connection[3] if connection else False
+            note = self.notes.get(name, server_def.get('note', ''))
+            direction = self.server_directions.get(name, server_def.get('direction', 'both'))
+            yield name, address, alive, note, direction
 
     def _enable_tcp_keepalive(self, writer, context):
         """Enable TCP keepalive on the provided writer's socket when possible."""
@@ -156,12 +234,12 @@ class TelnetRelay:
 
     async def connect_to_server(self, address, port, server_name):
         """Connect to a server with exponential backoff on failure."""
-        logging.debug(f'Connecting to server {address}:{port}')
+        logging.debug(f'Connecting to {server_name} at {address}:{port}')
         delay = 1  # Start with 1-second delay
         while True:
             try:
                 reader, writer = await asyncio.open_connection(address, port)
-                logging.debug(f'Connected to server {address}:{port}')
+                logging.debug(f'Connected to {server_name} at {address}:{port}')
                 self.server_connections[server_name] = (reader, writer, f'{address}:{port}', True)
                 self._enable_tcp_keepalive(writer, f'server connection {server_name}')
                 asyncio.create_task(self.relay_server_data(reader, writer, server_name))
@@ -258,9 +336,7 @@ class TelnetRelay:
     async def send_status_to_single_client(self, writer):
         """Send the server connection status to a single client."""
         status_message = "Server Connection Status:\n"
-        for server_name, (_, _, address, alive) in self.server_connections.items():
-            note = self.notes.get(server_name, "")
-            direction = self.server_directions.get(server_name, 'both')
+        for server_name, address, alive, note, direction in self._iter_server_status():
             status_message += f"{server_name} ({address}): {'Connected' if alive else 'Disconnected'} - {note} [direction: {direction}]\n"
         status_message += "\n"
         writer.write(status_message.encode())
@@ -268,11 +344,15 @@ class TelnetRelay:
 
     async def connect_to_all_servers(self):
         """Attempt to reconnect to all servers that are currently not connected."""
-        for server_name, (_, _, address, alive) in list(self.server_connections.items()):
+        for server_def in self.server_definitions:
+            server_name = server_def['name']
+            connection = self.server_connections.get(server_name)
+            address = connection[2] if connection else server_def['address']
+            alive = connection[3] if connection else False
             if not alive:
                 logging.debug(f'Server {server_name} is not connected, attempting to reconnect')
-                address, port = address.split(':')
-                await self.connect_to_server(address, int(port), server_name)
+                addr, port = address.split(':')
+                await self.connect_to_server(addr, int(port), server_name)
 
     async def relay_server_data(self, reader, writer, server_name):
         """Relay data from server to clients and handle server responses."""
@@ -290,7 +370,7 @@ class TelnetRelay:
                 if b"call" in data or b"sign:" in data or b"login" in data:
                     logging.debug(f'Received "call:" or "callsign:" or "login:" from {server_name}, sending response')
                     await asyncio.sleep(2)  # 2-second delay for login response
-                    if server_name == 'Server1':
+                    if server_name == self.primary_server_name:
                         response = f"{self.callsign}\r\n".encode()  # Full callsign for Server1
                     else:
                         base_callsign = strip_callsign_suffix(self.callsign)
@@ -326,9 +406,7 @@ class TelnetRelay:
         while True:
             try:
                 status_message = "Server Connection Status:\n"
-                for server_name, (_, _, address, alive) in self.server_connections.items():
-                    note = self.notes.get(server_name, "")
-                    direction = self.server_directions.get(server_name, 'both')
+                for server_name, address, alive, note, direction in self._iter_server_status():
                     status_message += f"{server_name} ({address}): {'Connected' if alive else 'Disconnected'} - {note} [direction: {direction}]\n"
                 status_message += "\n"
                 for client_writer in self.client_writers[:]:
@@ -344,10 +422,12 @@ class TelnetRelay:
         """Start the relay server and manage all connections."""
         logging.debug('Starting relay')
 
-        for i, server in enumerate(self.servers):
-            if server:
-                addr, port = server.split(':')
-                asyncio.create_task(self.connect_to_server(addr, int(port), f'Server{i+1}'))
+        for server_def in self.server_definitions:
+            self.server_connections.setdefault(server_def['name'], (None, None, server_def['address'], False))
+
+        for server_def in self.server_definitions:
+            addr, port = server_def['address'].split(':')
+            asyncio.create_task(self.connect_to_server(addr, int(port), server_def['name']))
 
         status_task = asyncio.create_task(self.send_status_to_clients())
 
@@ -370,24 +450,18 @@ if __name__ == "__main__":
     else:
         logging.getLogger().setLevel(logging.INFO)
 
-    servers = [args.server1, args.server2, args.server3, args.server4]
-    notes = {
-        'Server1': args.note1 or '',
-        'Server2': args.note2 or '',
-        'Server3': args.note3 or '',
-        'Server4': args.note4 or ''
-    }
-    server_directions = {
-        'Server1': args.server1_direction,
-        'Server2': args.server2_direction,
-        'Server3': args.server3_direction,
-        'Server4': args.server4_direction
-    }
+    try:
+        server_definitions = build_server_definitions(args)
+    except ValueError as exc:
+        logging.error(str(exc))
+        raise SystemExit(1)
+    notes = {server['name']: server.get('note', '') for server in server_definitions}
+    server_directions = {server['name']: server.get('direction', 'both') for server in server_definitions}
 
     client_timeout = args.client_timeout if args.client_timeout > 0 else None
     server_timeout = args.server_timeout if args.server_timeout > 0 else None
 
-    relay = TelnetRelay(servers, notes, args.listen_port, args.callsign, args.login_prompt,
+    relay = TelnetRelay(server_definitions, notes, args.listen_port, args.callsign, args.login_prompt,
                         client_timeout=client_timeout, server_timeout=server_timeout,
                         server_directions=server_directions)
     asyncio.run(relay.start_relay())
