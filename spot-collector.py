@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import contextlib
+from collections import deque
 import json
 import logging
 import random
@@ -204,6 +205,7 @@ class TelnetRelay:
         self.client_timeout = client_timeout
         self.server_timeout = server_timeout if server_timeout is not None else DEFAULT_SERVER_TIMEOUT
         self.server_directions = server_directions or {}
+        self.server_message_times = {server['name']: deque() for server in self.server_definitions}
         self.primary_server_name = self.server_definitions[0]['name']
         logging.debug(f'TelnetRelay initialized with servers: {self.server_definitions}, listen_port: {listen_port}, '
                       f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}, '
@@ -228,6 +230,30 @@ class TelnetRelay:
             note = self.notes.get(name, server_def.get('note', ''))
             direction = self.server_directions.get(name, server_def.get('direction', 'both'))
             yield name, address, alive, note, direction, connected_at
+
+    def _record_server_message(self, server_name):
+        """Track timestamps of inbound messages for simple rate calculation."""
+        timestamps = self.server_message_times.get(server_name)
+        if timestamps is None:
+            return
+        now = time.time()
+        cutoff = now - 900  # 15 minutes
+        timestamps.append(now)
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+
+    def _compute_rate_per_hour(self, server_name):
+        """Compute per-hour rate based on the last 15 minutes of messages."""
+        timestamps = self.server_message_times.get(server_name)
+        if not timestamps:
+            return '-'
+        now = time.time()
+        cutoff = now - 900
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+        # Scale 15-minute count to per-hour rate
+        rate = (len(timestamps) * 4)
+        return f'{rate}'
 
     async def _write_with_timeout(self, writer, data, context):
         """Write to a stream with a timeout to avoid stalling on slow peers."""
@@ -408,24 +434,27 @@ class TelnetRelay:
         for server_name, address, alive, note, direction, connected_at in self._iter_server_status():
             state = 'Connected' if alive else 'Disconnected'
             uptime = _format_duration(time.time() - connected_at) if alive and connected_at else '-'
+            rate = self._compute_rate_per_hour(server_name)
             rows.append({
                 'name': server_name,
                 'address': address,
                 'state': state,
                 'direction': direction,
+                'rate': rate,
                 'uptime': uptime,
                 'note': note or ''
             })
 
         if rows:
-            headers = ('Name', 'Address', 'State', 'Direction', 'Up', 'Note')
+            headers = ('Name', 'Address', 'State', 'Direction', 'Rate/hr', 'Up', 'Note')
             widths = {
                 'name': len(headers[0]),
                 'address': len(headers[1]),
                 'state': len(headers[2]),
                 'direction': len(headers[3]),
-                'uptime': len(headers[4]),
-                'note': len(headers[5])
+                'rate': len(headers[4]),
+                'uptime': len(headers[5]),
+                'note': len(headers[6])
             }
 
             for row in rows:
@@ -433,6 +462,7 @@ class TelnetRelay:
                 widths['address'] = max(widths['address'], len(row['address']))
                 widths['state'] = max(widths['state'], len(row['state']))
                 widths['direction'] = max(widths['direction'], len(row['direction']))
+                widths['rate'] = max(widths['rate'], len(row['rate']))
                 widths['uptime'] = max(widths['uptime'], len(row['uptime']))
                 widths['note'] = max(widths['note'], len(row['note']))
 
@@ -441,14 +471,16 @@ class TelnetRelay:
                 f"{headers[1]:<{widths['address']}}  "
                 f"{headers[2]:<{widths['state']}}  "
                 f"{headers[3]:<{widths['direction']}}  "
-                f"{headers[4]:<{widths['uptime']}}  "
-                f"{headers[5]}"
+                f"{headers[4]:<{widths['rate']}}  "
+                f"{headers[5]:<{widths['uptime']}}  "
+                f"{headers[6]}"
             )
             divider_line = (
                 f"{'-' * widths['name']}  "
                 f"{'-' * widths['address']}  "
                 f"{'-' * widths['state']}  "
                 f"{'-' * widths['direction']}  "
+                f"{'-' * widths['rate']}  "
                 f"{'-' * widths['uptime']}  "
                 f"{'-' * widths['note']}"
             )
@@ -461,6 +493,7 @@ class TelnetRelay:
                     f"{row['address']:<{widths['address']}}  "
                     f"{row['state']:<{widths['state']}}  "
                     f"{row['direction']:<{widths['direction']}}  "
+                    f"{row['rate']:<{widths['rate']}}  "
                     f"{row['uptime']:<{widths['uptime']}}  "
                     f"{row['note']}"
                 )
@@ -579,6 +612,7 @@ class TelnetRelay:
                     logging.debug(f'No more data from server {server_name}')
                     break
                 logging.debug(f'Received data from server {server_name}: {data}')
+                self._record_server_message(server_name)
 
                 lower_chunk = data.lower()
                 prompt_match = re.search(rb'(?:^|\r?\n)\s*(call|callsign|login)\s*:?', lower_chunk)
@@ -628,6 +662,7 @@ class TelnetRelay:
 
         for server_def in self.server_definitions:
             self.server_connections.setdefault(server_def['name'], (None, None, server_def['address'], False, None))
+            self.server_message_times.setdefault(server_def['name'], deque())
             self.handshake_sent.setdefault(server_def['name'], False)
 
         for server_def in self.server_definitions:
