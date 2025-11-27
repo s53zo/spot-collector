@@ -1,0 +1,20 @@
+{
+  "server1": "s50dxs.s53m.com:8000",
+  "server2": "10.0.10.101:7300",
+  "server3": "10.0.10.104:7300",
+  "server4": "10.0.10.154:7373",
+  "server1_direction": "both",
+  "server2_direction": "in",
+  "server3_direction": "in",
+  "server4_direction": "in",
+  "listen_port": 8000,
+  "callsign": "TK0C-23",
+  "note1": "S50DXS",
+  "note2": "S53M1 skimmer",
+  "note3": "S53M4 skimmer",
+  "note4": "Flexradio skimmer",
+  "login_prompt": "login: ",
+  "client_timeout": 0,
+  "server_timeout": 0,
+  "debug": true
+}

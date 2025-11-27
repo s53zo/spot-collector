@@ -50,10 +50,12 @@ Run the script using the following required arguments:
 
     --server3 and --server4: Addresses and ports for additional servers.
     --note1, --note2, --note3, --note4: Descriptive notes for each server.
-    --debug: Enable debug logging for troubleshooting.
+    --server1-direction/--server2-direction/--server3-direction/--server4-direction: Direction of message flow for each server (`in`, `out`, or `both`). Defaults: server1=`both`, others=`in`.
+    --debug: Enable debug logging for troubleshooting (includes console traffic traces).
     --login-prompt "callsign: ": Send this prompt to the client. Some SW needs this to establish the connection.
     --client-timeout: Inactivity timeout (seconds) for downstream client sessions; 0 keeps listeners attached indefinitely.
     --server-timeout: Inactivity timeout (seconds) for upstream DX cluster links; 0 relies on TCP keepalive to detect failures.
+    --config /path/to/spot-collector.json: Load all arguments from a JSON config file and ignore other CLI flags.
 
    ```
 
@@ -75,6 +77,34 @@ Run the script using the following required arguments:
      --login-prompt "login: "
 
    ```
+
+5. **Using a JSON config file:**
+   ```json
+   {
+     "server1": "s50dxs.s53m.com:8000",
+     "server2": "10.0.10.101:7300",
+     "server3": "10.0.10.104:7300",
+     "server4": "10.0.10.154:7373",
+     "server1_direction": "both",
+     "server2_direction": "in",
+     "server3_direction": "in",
+     "server4_direction": "in",
+     "listen_port": 8000,
+     "callsign": "S53M-23",
+     "note1": "S50DXS",
+     "note2": "Local Skimmer 1",
+     "note3": "Local Skimmer 2",
+     "note4": "Flexradio Skimmer",
+     "login_prompt": "login: ",
+     "client_timeout": 0,
+     "server_timeout": 0,
+     "debug": false
+   }
+   ```
+   Start the relay with `python3 spot-collector.py --config /path/to/spot-collector.json`. When `--config` is provided, other CLI flags are ignored and required values (`server1`, `server2`, `listen_port`, `callsign`) must be present in the JSON.
+   - `direction=in` forwards data from that server to all clients only.
+   - `direction=out` forwards data from clients to that server only.
+   - `direction=both` enables bidirectional forwarding.
 
 
  
