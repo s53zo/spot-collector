@@ -196,7 +196,7 @@ class TelnetRelay:
         self.client_writers = []
         self.client_queues = {}
         self.client_sender_tasks = {}
-        self.server_connections = {}  # server_name: (reader, writer, address, alive)
+        self.server_connections = {}  # server_name: (reader, writer, address, alive, connected_at)
         self.connector_tasks = {}
         self.server_locks = {server['name']: asyncio.Lock() for server in self.server_definitions}
         self.handshake_sent = {}
@@ -224,9 +224,10 @@ class TelnetRelay:
             connection = self.server_connections.get(name)
             address = connection[2] if connection else server_def['address']
             alive = connection[3] if connection else False
+            connected_at = connection[4] if connection else None
             note = self.notes.get(name, server_def.get('note', ''))
             direction = self.server_directions.get(name, server_def.get('direction', 'both'))
-            yield name, address, alive, note, direction
+            yield name, address, alive, note, direction, connected_at
 
     async def _write_with_timeout(self, writer, data, context):
         """Write to a stream with a timeout to avoid stalling on slow peers."""
@@ -306,6 +307,39 @@ class TelnetRelay:
         except OSError as e:
             logging.debug(f'Failed to enable TCP keepalive for {context}: {e}')
 
+    @staticmethod
+    def _strip_telnet_control(data):
+        """Remove Telnet negotiation sequences (IAC commands) from a byte stream."""
+        result = bytearray()
+        i = 0
+        length = len(data)
+        while i < length:
+            byte = data[i]
+            if byte == 255:  # IAC
+                if i + 1 >= length:
+                    break
+                command = data[i + 1]
+                if command in (251, 252, 253, 254):  # WILL/WONT/DO/DONT + option byte
+                    i += 3
+                    continue
+                if command == 250:  # SB ... IAC SE
+                    i += 2
+                    while i < length:
+                        if data[i] == 255 and i + 1 < length and data[i + 1] == 240:
+                            i += 2
+                            break
+                        i += 1
+                    continue
+                if command == 255:  # Escaped IAC
+                    result.append(255)
+                    i += 2
+                    continue
+                i += 2
+                continue
+            result.append(byte)
+            i += 1
+        return bytes(result)
+
     def _start_connector(self, server_def, force_restart=False):
         """Ensure a single connector task per server."""
         name = server_def['name']
@@ -327,7 +361,7 @@ class TelnetRelay:
                     logging.debug(f'Connecting to {name} at {address}:{port}')
                     reader, writer = await asyncio.open_connection(address, int(port))
                     logging.debug(f'Connected to {name} at {address}:{port}')
-                    self.server_connections[name] = (reader, writer, f'{address}:{port}', True)
+                    self.server_connections[name] = (reader, writer, f'{address}:{port}', True, time.time())
                     self.handshake_sent[name] = False
                     self._enable_tcp_keepalive(writer, f'server connection {name}')
                 delay = 1  # reset backoff on success
@@ -343,7 +377,7 @@ class TelnetRelay:
                     connection[1].close()
                     with contextlib.suppress(Exception):
                         await connection[1].wait_closed()
-                self.server_connections[name] = (None, None, f'{address}:{port}', False)
+                self.server_connections[name] = (None, None, f'{address}:{port}', False, None)
                 self.handshake_sent[name] = False
             sleep_for = min(delay, RECONNECT_INTERVAL) + random.uniform(0, 1)
             logging.debug(f'Retrying connection to server {name} in {sleep_for:.1f} seconds')
@@ -370,11 +404,68 @@ class TelnetRelay:
             'Upstream servers:',
         ]
 
-        for server_name, address, alive, note, direction in self._iter_server_status():
+        rows = []
+        for server_name, address, alive, note, direction, connected_at in self._iter_server_status():
             state = 'Connected' if alive else 'Disconnected'
-            direction_str = f'direction={direction}'
-            note_str = f' - {note}' if note else ''
-            status_lines.append(f'- {server_name} ({address}): {state} [{direction_str}]{note_str}')
+            uptime = _format_duration(time.time() - connected_at) if alive and connected_at else '-'
+            rows.append({
+                'name': server_name,
+                'address': address,
+                'state': state,
+                'direction': direction,
+                'uptime': uptime,
+                'note': note or ''
+            })
+
+        if rows:
+            headers = ('Name', 'Address', 'State', 'Direction', 'Up', 'Note')
+            widths = {
+                'name': len(headers[0]),
+                'address': len(headers[1]),
+                'state': len(headers[2]),
+                'direction': len(headers[3]),
+                'uptime': len(headers[4]),
+                'note': len(headers[5])
+            }
+
+            for row in rows:
+                widths['name'] = max(widths['name'], len(row['name']))
+                widths['address'] = max(widths['address'], len(row['address']))
+                widths['state'] = max(widths['state'], len(row['state']))
+                widths['direction'] = max(widths['direction'], len(row['direction']))
+                widths['uptime'] = max(widths['uptime'], len(row['uptime']))
+                widths['note'] = max(widths['note'], len(row['note']))
+
+            header_line = (
+                f"{headers[0]:<{widths['name']}}  "
+                f"{headers[1]:<{widths['address']}}  "
+                f"{headers[2]:<{widths['state']}}  "
+                f"{headers[3]:<{widths['direction']}}  "
+                f"{headers[4]:<{widths['uptime']}}  "
+                f"{headers[5]}"
+            )
+            divider_line = (
+                f"{'-' * widths['name']}  "
+                f"{'-' * widths['address']}  "
+                f"{'-' * widths['state']}  "
+                f"{'-' * widths['direction']}  "
+                f"{'-' * widths['uptime']}  "
+                f"{'-' * widths['note']}"
+            )
+            status_lines.append(header_line)
+            status_lines.append(divider_line)
+
+            for row in rows:
+                status_lines.append(
+                    f"{row['name']:<{widths['name']}}  "
+                    f"{row['address']:<{widths['address']}}  "
+                    f"{row['state']:<{widths['state']}}  "
+                    f"{row['direction']:<{widths['direction']}}  "
+                    f"{row['uptime']:<{widths['uptime']}}  "
+                    f"{row['note']}"
+                )
+        else:
+            status_lines.append('No upstream servers configured.')
 
         status_lines.append('')
         return '\n'.join(status_lines)
@@ -402,7 +493,11 @@ class TelnetRelay:
                     if not data:
                         logging.debug(f'No more data from client {client_address}')
                         break
-                    message = data.decode('utf-8').strip()
+                    sanitized_data = self._strip_telnet_control(data)
+                    if not sanitized_data:
+                        logging.debug(f'Ignoring Telnet control data from client {client_address}')
+                        continue
+                    message = sanitized_data.decode('utf-8', errors='ignore').strip()
                     logging.debug(f'Received data from client {client_address}: {message}')
 
                     if message.lower() == "status":
@@ -425,20 +520,17 @@ class TelnetRelay:
                         await self.send_uptime(writer)
                         continue
 
-                    for server_name, (_, server_writer, _, alive) in list(self.server_connections.items()):
+                    for server_name, (_, server_writer, _, alive, _) in list(self.server_connections.items()):
                         if not alive or not server_writer or server_writer.is_closing():
                             continue
                         if not self._direction_allows_outbound(server_name):
                             continue
-                        ok = await self._write_with_timeout(server_writer, data, f'server {server_name}')
+                        ok = await self._write_with_timeout(server_writer, sanitized_data, f'server {server_name}')
                         if ok:
                             logging.debug(f'Relayed data from client {client_address} to {server_name}')
 
                 except asyncio.TimeoutError:
                     logging.debug(f'Client {client_address} inactive for {self.client_timeout} seconds')
-                    break
-                except UnicodeDecodeError as e:
-                    logging.error(f'Failed to decode data from client {client_address}: {e}')
                     break
 
         except (ConnectionResetError, BrokenPipeError) as e:
@@ -514,7 +606,7 @@ class TelnetRelay:
             logging.error(f'Connection to server {server_name} lost: {e}')
         finally:
             logging.debug(f'Closing connection to server {server_name}')
-            self.server_connections[server_name] = (None, None, self.server_connections[server_name][2], False)
+            self.server_connections[server_name] = (None, None, self.server_connections[server_name][2], False, None)
 
     async def send_status_to_clients(self):
         """Periodically send connection status to all connected clients."""
@@ -535,7 +627,7 @@ class TelnetRelay:
         logging.debug('Starting relay')
 
         for server_def in self.server_definitions:
-            self.server_connections.setdefault(server_def['name'], (None, None, server_def['address'], False))
+            self.server_connections.setdefault(server_def['name'], (None, None, server_def['address'], False, None))
             self.handshake_sent.setdefault(server_def['name'], False)
 
         for server_def in self.server_definitions:
