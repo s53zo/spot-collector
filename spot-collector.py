@@ -1,13 +1,17 @@
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
+import random
 import re
 import socket
 import time
 
 RECONNECT_INTERVAL = 300  # 5 minutes max delay for reconnect attempts
 STATUS_INTERVAL = 300     # 5 minutes between status updates
+DRAIN_TIMEOUT = 5         # Seconds to wait on a drain before giving up
+DEFAULT_SERVER_TIMEOUT = 300  # Seconds without data before considering an upstream stalled
 
 def configure_logging(debug_enabled):
     """Configure root logger to emit to stdout."""
@@ -125,6 +129,18 @@ def _normalize_direction(direction, default_value):
         raise ValueError(f'Invalid direction "{direction}". Use one of in/out/both.')
     return direction
 
+
+def _format_duration(seconds):
+    """Return a human-friendly duration string."""
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f'{hours}h {minutes}m {secs}s'
+    if minutes:
+        return f'{minutes}m {secs}s'
+    return f'{secs}s'
+
 def build_server_definitions(args):
     """
     Build a list of server definitions that can grow beyond the legacy 4-slot layout.
@@ -178,10 +194,15 @@ class TelnetRelay:
         self.callsign = callsign
         self.login_prompt = login_prompt
         self.client_writers = []
+        self.client_queues = {}
+        self.client_sender_tasks = {}
         self.server_connections = {}  # server_name: (reader, writer, address, alive)
+        self.connector_tasks = {}
+        self.server_locks = {server['name']: asyncio.Lock() for server in self.server_definitions}
+        self.handshake_sent = {}
         self.start_time = time.time()  # Track when the server started
         self.client_timeout = client_timeout
-        self.server_timeout = server_timeout
+        self.server_timeout = server_timeout if server_timeout is not None else DEFAULT_SERVER_TIMEOUT
         self.server_directions = server_directions or {}
         self.primary_server_name = self.server_definitions[0]['name']
         logging.debug(f'TelnetRelay initialized with servers: {self.server_definitions}, listen_port: {listen_port}, '
@@ -206,6 +227,59 @@ class TelnetRelay:
             note = self.notes.get(name, server_def.get('note', ''))
             direction = self.server_directions.get(name, server_def.get('direction', 'both'))
             yield name, address, alive, note, direction
+
+    async def _write_with_timeout(self, writer, data, context):
+        """Write to a stream with a timeout to avoid stalling on slow peers."""
+        if writer.is_closing():
+            return False
+        writer.write(data)
+        try:
+            await asyncio.wait_for(writer.drain(), timeout=DRAIN_TIMEOUT)
+            return True
+        except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError) as exc:
+            logging.error(f'Write to {context} failed or timed out: {exc}')
+            return False
+
+    async def _enqueue_client(self, writer, data, context):
+        """Queue data for a client; drop the client if it falls behind."""
+        queue = self.client_queues.get(writer)
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(data)
+        except asyncio.QueueFull:
+            logging.error(f'Client {context} send queue full; disconnecting')
+            await self._cleanup_client(writer)
+
+    async def _client_sender(self, writer, queue, context):
+        """Serialize writes to a client so one slow client cannot block others."""
+        try:
+            while True:
+                data = await queue.get()
+                if data is None:
+                    break
+                ok = await self._write_with_timeout(writer, data, context)
+                if not ok:
+                    break
+        finally:
+            await self._cleanup_client(writer)
+
+    async def _cleanup_client(self, writer):
+        """Remove client state and close the connection."""
+        current = asyncio.current_task()
+        task = self.client_sender_tasks.pop(writer, None)
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+        queue = self.client_queues.pop(writer, None)
+        if queue is not None:
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(None)
+        if writer in self.client_writers:
+            self.client_writers.remove(writer)
+        if writer and not writer.is_closing():
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     def _enable_tcp_keepalive(self, writer, context):
         """Enable TCP keepalive on the provided writer's socket when possible."""
@@ -232,34 +306,91 @@ class TelnetRelay:
         except OSError as e:
             logging.debug(f'Failed to enable TCP keepalive for {context}: {e}')
 
-    async def connect_to_server(self, address, port, server_name):
-        """Connect to a server with exponential backoff on failure."""
-        logging.debug(f'Connecting to {server_name} at {address}:{port}')
-        delay = 1  # Start with 1-second delay
+    def _start_connector(self, server_def, force_restart=False):
+        """Ensure a single connector task per server."""
+        name = server_def['name']
+        task = self.connector_tasks.get(name)
+        if task and not task.done():
+            if not force_restart:
+                return
+            task.cancel()
+        self.connector_tasks[name] = asyncio.create_task(self._maintain_connection(server_def))
+
+    async def _maintain_connection(self, server_def):
+        """Maintain a single connection task per server with bounded backoff."""
+        name = server_def['name']
+        address, port = server_def['address'].split(':')
+        delay = 1
         while True:
             try:
-                reader, writer = await asyncio.open_connection(address, port)
-                logging.debug(f'Connected to {server_name} at {address}:{port}')
-                self.server_connections[server_name] = (reader, writer, f'{address}:{port}', True)
-                self._enable_tcp_keepalive(writer, f'server connection {server_name}')
-                asyncio.create_task(self.relay_server_data(reader, writer, server_name))
-                return
+                async with self.server_locks[name]:
+                    logging.debug(f'Connecting to {name} at {address}:{port}')
+                    reader, writer = await asyncio.open_connection(address, int(port))
+                    logging.debug(f'Connected to {name} at {address}:{port}')
+                    self.server_connections[name] = (reader, writer, f'{address}:{port}', True)
+                    self.handshake_sent[name] = False
+                    self._enable_tcp_keepalive(writer, f'server connection {name}')
+                delay = 1  # reset backoff on success
+                await self.relay_server_data(reader, writer, name)
+            except asyncio.CancelledError:
+                logging.debug(f'Connector for {name} cancelled')
+                break
             except Exception as e:
                 logging.error(f'Error connecting to server {address}:{port} - {e}')
-                logging.debug(f'Retrying connection to server {address}:{port} in {delay} seconds')
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RECONNECT_INTERVAL)
+            finally:
+                connection = self.server_connections.get(name)
+                if connection and connection[1] and not connection[1].is_closing():
+                    connection[1].close()
+                    with contextlib.suppress(Exception):
+                        await connection[1].wait_closed()
+                self.server_connections[name] = (None, None, f'{address}:{port}', False)
+                self.handshake_sent[name] = False
+            sleep_for = min(delay, RECONNECT_INTERVAL) + random.uniform(0, 1)
+            logging.debug(f'Retrying connection to server {name} in {sleep_for:.1f} seconds')
+            await asyncio.sleep(sleep_for)
+            delay = min(delay * 2, RECONNECT_INTERVAL)
+
+    def _build_status_message(self):
+        """Compose a more informative status payload for clients."""
+        uptime = _format_duration(time.time() - self.start_time)
+        client_count = len([w for w in self.client_writers if not w.is_closing()])
+        primary = self.primary_server_name
+        client_timeout = f'{self.client_timeout}s' if self.client_timeout else 'disabled'
+        server_timeout = f'{self.server_timeout}s' if self.server_timeout else 'disabled'
+
+        status_lines = [
+            'Spot Collector Status',
+            f'Uptime: {uptime}',
+            f'Listening on: {self.listen_port}',
+            f'Primary server: {primary}',
+            f'Clients connected: {client_count}',
+            f'Client timeout: {client_timeout}',
+            f'Server timeout: {server_timeout}',
+            '',
+            'Upstream servers:',
+        ]
+
+        for server_name, address, alive, note, direction in self._iter_server_status():
+            state = 'Connected' if alive else 'Disconnected'
+            direction_str = f'direction={direction}'
+            note_str = f' - {note}' if note else ''
+            status_lines.append(f'- {server_name} ({address}): {state} [{direction_str}]{note_str}')
+
+        status_lines.append('')
+        return '\n'.join(status_lines)
 
     async def handle_client(self, reader, writer):
         """Handle incoming client connections."""
         client_address = writer.get_extra_info('peername')
         logging.debug(f'New client connection from {client_address}')
         self.client_writers.append(writer)
+        self.client_queues[writer] = asyncio.Queue(maxsize=100)
+        sender_task = asyncio.create_task(self._client_sender(writer, self.client_queues[writer], f'client {client_address}'))
+        self.client_sender_tasks[writer] = sender_task
         self._enable_tcp_keepalive(writer, f'client {client_address}')
         
         try:
-            writer.write(self.login_prompt.encode())
-            await writer.drain()
+            await self._enqueue_client(writer, self.login_prompt.encode(), f'client {client_address}')
             logging.debug(f'Sent login prompt to client {client_address}')
 
             while True:
@@ -299,9 +430,9 @@ class TelnetRelay:
                             continue
                         if not self._direction_allows_outbound(server_name):
                             continue
-                        server_writer.write(data)
-                        await server_writer.drain()
-                        logging.debug(f'Relayed data from client {client_address} to {server_name}')
+                        ok = await self._write_with_timeout(server_writer, data, f'server {server_name}')
+                        if ok:
+                            logging.debug(f'Relayed data from client {client_address} to {server_name}')
 
                 except asyncio.TimeoutError:
                     logging.debug(f'Client {client_address} inactive for {self.client_timeout} seconds')
@@ -314,33 +445,27 @@ class TelnetRelay:
             logging.error(f'Connection to client {client_address} lost: {e}')
         finally:
             logging.debug(f'Closing client connection {client_address}')
-            if writer in self.client_writers:
-                self.client_writers.remove(writer)
-            writer.close()
-            await writer.wait_closed()
+            await self._cleanup_client(writer)
 
     async def list_connected_clients(self, writer):
         """List all currently connected clients."""
         clients = "\n".join([str(writer.get_extra_info('peername')) for writer in self.client_writers])
         status_message = f"Connected clients:\n{clients}\n"
-        writer.write(status_message.encode())
-        await writer.drain()
+        peer = writer.get_extra_info('peername')
+        await self._enqueue_client(writer, status_message.encode(), f'client {peer}')
 
     async def send_uptime(self, writer):
         """Send the uptime of the relay server."""
         uptime_seconds = time.time() - self.start_time
         uptime_message = f"Server Uptime: {uptime_seconds:.2f} seconds\n"
-        writer.write(uptime_message.encode())
-        await writer.drain()
+        peer = writer.get_extra_info('peername')
+        await self._enqueue_client(writer, uptime_message.encode(), f'client {peer}')
 
     async def send_status_to_single_client(self, writer):
         """Send the server connection status to a single client."""
-        status_message = "Server Connection Status:\n"
-        for server_name, address, alive, note, direction in self._iter_server_status():
-            status_message += f"{server_name} ({address}): {'Connected' if alive else 'Disconnected'} - {note} [direction: {direction}]\n"
-        status_message += "\n"
-        writer.write(status_message.encode())
-        await writer.drain()
+        status_message = self._build_status_message()
+        peer = writer.get_extra_info('peername')
+        await self._enqueue_client(writer, status_message.encode(), f'client {peer}')
 
     async def connect_to_all_servers(self):
         """Attempt to reconnect to all servers that are currently not connected."""
@@ -351,39 +476,37 @@ class TelnetRelay:
             alive = connection[3] if connection else False
             if not alive:
                 logging.debug(f'Server {server_name} is not connected, attempting to reconnect')
-                addr, port = address.split(':')
-                await self.connect_to_server(addr, int(port), server_name)
+                self._start_connector(server_def, force_restart=True)
 
     async def relay_server_data(self, reader, writer, server_name):
         """Relay data from server to clients and handle server responses."""
         try:
             while True:
-                if self.server_timeout:
-                    data = await asyncio.wait_for(reader.read(1024), timeout=self.server_timeout)
-                else:
-                    data = await reader.read(1024)
+                data = await asyncio.wait_for(reader.read(1024), timeout=self.server_timeout)
                 if not data:
                     logging.debug(f'No more data from server {server_name}')
                     break
                 logging.debug(f'Received data from server {server_name}: {data}')
 
-                if b"call" in data or b"sign:" in data or b"login" in data:
-                    logging.debug(f'Received "call:" or "callsign:" or "login:" from {server_name}, sending response')
+                lower_chunk = data.lower()
+                prompt_match = re.search(rb'(?:^|\r?\n)\s*(call|callsign|login)\s*:?', lower_chunk)
+                if prompt_match and not self.handshake_sent.get(server_name):
+                    logging.debug(f'Received login prompt from {server_name}, sending callsign once')
                     await asyncio.sleep(2)  # 2-second delay for login response
                     if server_name == self.primary_server_name:
                         response = f"{self.callsign}\r\n".encode()  # Full callsign for Server1
                     else:
                         base_callsign = strip_callsign_suffix(self.callsign)
                         response = f"{base_callsign}\r\n".encode()  # Stripped callsign for others
-                    writer.write(response)
-                    await writer.drain()
+                    await self._write_with_timeout(writer, response, f'server {server_name}')
+                    self.handshake_sent[server_name] = True
 
                 if self._direction_allows_inbound(server_name):
                     for client_writer in self.client_writers[:]:
-                        if not client_writer.is_closing():
-                            client_writer.write(data)
-                            await client_writer.drain()
-                            logging.debug(f'Relayed data from server {server_name} to client')
+                        if client_writer.is_closing():
+                            continue
+                        await self._enqueue_client(client_writer, data, f'client {client_writer.get_extra_info("peername")}')
+                        logging.debug(f'Relayed data from server {server_name} to client')
 
         except asyncio.TimeoutError:
             logging.error(f'No data from {server_name} for {self.server_timeout} seconds, reconnecting...')
@@ -392,27 +515,16 @@ class TelnetRelay:
         finally:
             logging.debug(f'Closing connection to server {server_name}')
             self.server_connections[server_name] = (None, None, self.server_connections[server_name][2], False)
-            writer.close()
-            await writer.wait_closed()
-            await self.reconnect_to_server(server_name)
-
-    async def reconnect_to_server(self, server_name):
-        """Reconnect to a specific server after disconnection."""
-        address, port = self.server_connections[server_name][2].split(':')
-        await self.connect_to_server(address, int(port), server_name)
 
     async def send_status_to_clients(self):
         """Periodically send connection status to all connected clients."""
         while True:
             try:
-                status_message = "Server Connection Status:\n"
-                for server_name, address, alive, note, direction in self._iter_server_status():
-                    status_message += f"{server_name} ({address}): {'Connected' if alive else 'Disconnected'} - {note} [direction: {direction}]\n"
-                status_message += "\n"
+                status_message = self._build_status_message()
                 for client_writer in self.client_writers[:]:
                     if not client_writer.is_closing():
-                        client_writer.write(status_message.encode())
-                        await client_writer.drain()
+                        peer = client_writer.get_extra_info('peername')
+                        await self._enqueue_client(client_writer, status_message.encode(), f'client {peer}')
                 await asyncio.sleep(STATUS_INTERVAL)
             except Exception as e:
                 logging.error(f'Status update task failed: {e}, restarting in 5 seconds')
@@ -424,10 +536,10 @@ class TelnetRelay:
 
         for server_def in self.server_definitions:
             self.server_connections.setdefault(server_def['name'], (None, None, server_def['address'], False))
+            self.handshake_sent.setdefault(server_def['name'], False)
 
         for server_def in self.server_definitions:
-            addr, port = server_def['address'].split(':')
-            asyncio.create_task(self.connect_to_server(addr, int(port), server_def['name']))
+            self._start_connector(server_def)
 
         status_task = asyncio.create_task(self.send_status_to_clients())
 
