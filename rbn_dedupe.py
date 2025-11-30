@@ -318,9 +318,9 @@ class RbnAggregator:
                     zone_tokens.append(token)
             zones = ",".join(zone_tokens) if zone_tokens else ""
             time_str = time.strftime("%H%MZ", time.gmtime(best.utz or now))
-            origin_fmt = f"{origin_out}-#:"
+            origin_fmt = f"{origin_out}-#"
             base = (
-                f"DX de {origin_fmt:<9}: "
+                f"DX de {origin_fmt:<9} "
                 f"{consensus_freq:8.1f}  "
                 f"{best.call:<12}"
                 f" {best.mode:<3}"
