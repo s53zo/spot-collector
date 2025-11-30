@@ -9,6 +9,8 @@ import re
 import socket
 import time
 
+from rbn_dedupe import RbnAggregator
+
 RECONNECT_INTERVAL = 300  # 5 minutes max delay for reconnect attempts
 STATUS_INTERVAL = 300     # 5 minutes between status updates
 DRAIN_TIMEOUT = 5         # Seconds to wait on a drain before giving up
@@ -55,6 +57,15 @@ def _create_parser(require_required_flags):
                         help="Optional inactivity timeout (seconds) for client connections; 0 disables the timeout")
     parser.add_argument('--server-timeout', dest='server_timeout', type=int, default=0,
                         help="Optional inactivity timeout (seconds) for upstream server connections; 0 disables the timeout")
+    parser.add_argument('--rbn-dedupe', dest='rbn_dedupe', action='store_true', help="Enable RBN-style de-duplication (aggregates DX de lines across skimmers)")
+    parser.add_argument('--rbn-dwell', dest='rbn_dwell', type=int, default=10, help="RBN dwell time in seconds (default: 10)")
+    parser.add_argument('--rbn-limbo', dest='rbn_limbo', type=int, default=300, help="RBN limbo timeout in seconds (default: 300)")
+    parser.add_argument('--rbn-respot', dest='rbn_respot', type=int, default=180, help="RBN respot suppression window in seconds (default: 180)")
+    parser.add_argument('--rbn-minqual', dest='rbn_minqual', type=int, default=2, help="Minimum skimmer count before emitting a spot (default: 2)")
+    parser.add_argument('--rbn-maxqual', dest='rbn_maxqual', type=int, default=9, help="Maximum quality value (default: 9)")
+    parser.add_argument('--rbn-search-khz', dest='rbn_search_khz', type=int, default=5, help="Frequency search window in kHz around the normalized key (default: 5)")
+    parser.add_argument('--rbn-max-deviants', dest='rbn_max_deviants', type=int, default=5, help="Number of deviant frequency deltas to remember per skimmer (default: 5)")
+    parser.add_argument('--rbn-trace', dest='rbn_trace', action='store_true', help="Print basic RBN de-duplication steps to the console for testing")
     return parser
 
 def parse_arguments():
@@ -188,7 +199,7 @@ def build_server_definitions(args):
     return server_definitions
 
 class TelnetRelay:
-    def __init__(self, server_definitions, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None, server_directions=None):
+    def __init__(self, server_definitions, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None, server_directions=None, rbn_config=None):
         self.server_definitions = server_definitions
         self.notes = notes
         self.listen_port = listen_port
@@ -207,10 +218,28 @@ class TelnetRelay:
         self.server_directions = server_directions or {}
         self.server_message_times = {server['name']: deque() for server in self.server_definitions}
         self.primary_server_name = self.server_definitions[0]['name']
+        self.server_buffers = {server['name']: '' for server in self.server_definitions}
+        self.rbn_timer_task = None
+        self.rbn_aggregator = None
+        if rbn_config and rbn_config.get('enabled'):
+            self.rbn_aggregator = RbnAggregator(
+                dwell_time=rbn_config.get('dwell_time', 10),
+                limbo_time=rbn_config.get('limbo_time', 300),
+                respot_time=rbn_config.get('respot_time', 180),
+                cache_time=rbn_config.get('cache_time', 3600),
+                min_quality=rbn_config.get('min_quality', 2),
+                max_quality=rbn_config.get('max_quality', 9),
+                search_khz=rbn_config.get('search_khz', 5),
+                max_deviants=rbn_config.get('max_deviants', 5),
+                trace=rbn_config.get('trace_fn'),
+            )
+            logging.info("RBN de-duplication enabled")
+        else:
+            logging.info("RBN de-duplication disabled")
         logging.debug(f'TelnetRelay initialized with servers: {self.server_definitions}, listen_port: {listen_port}, '
                       f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}, '
                       f'client_timeout: {client_timeout}, server_timeout: {server_timeout}, '
-                      f'server_directions: {self.server_directions}')
+                      f'server_directions: {self.server_directions}, rbn_enabled: {bool(self.rbn_aggregator)}')
 
     def _direction_allows_outbound(self, server_name):
         direction = self.server_directions.get(server_name, 'both')
@@ -219,6 +248,19 @@ class TelnetRelay:
     def _direction_allows_inbound(self, server_name):
         direction = self.server_directions.get(server_name, 'both')
         return direction in ('in', 'both')
+
+    async def _deliver_lines_to_clients(self, lines):
+        """Send already-deduped textual lines to all clients."""
+        if not lines:
+            return
+        payloads = [f"{line}\r\n".encode() for line in lines]
+        for client_writer in self.client_writers[:]:
+            if client_writer.is_closing():
+                continue
+            peer = client_writer.get_extra_info('peername')
+            for payload in payloads:
+                await self._enqueue_client(client_writer, payload, f'client {peer}')
+                logging.debug(f'Relayed RBN line to client {peer}: {payload!r}')
 
     def _iter_server_status(self):
         for server_def in self.server_definitions:
@@ -365,6 +407,35 @@ class TelnetRelay:
             result.append(byte)
             i += 1
         return bytes(result)
+
+    async def _process_rbn_data(self, server_name, data):
+        """Decode inbound data into lines, feed the RBN aggregator, and fan out results."""
+        if not self.rbn_aggregator:
+            return
+        cleaned = self._strip_telnet_control(data)
+        try:
+            text = cleaned.decode('utf-8', errors='ignore')
+        except Exception:
+            return
+        if '\n' not in text and '\r' not in text:
+            # Likely a prompt or partial line; forward as-is so logins are not blocked.
+            self.server_buffers[server_name] = ''
+            for client_writer in self.client_writers[:]:
+                if client_writer.is_closing():
+                    continue
+                await self._enqueue_client(client_writer, data, f'client {client_writer.get_extra_info("peername")}')
+            return
+        buffer = self.server_buffers.get(server_name, '')
+        text = buffer + text
+        lines = text.splitlines()
+        if text and text[-1] not in ('\n', '\r'):
+            self.server_buffers[server_name] = lines.pop()
+        else:
+            self.server_buffers[server_name] = ''
+        outputs = []
+        for line in lines:
+            outputs.extend(self.rbn_aggregator.ingest_line(line))
+        await self._deliver_lines_to_clients(outputs)
 
     def _start_connector(self, server_def, force_restart=False):
         """Ensure a single connector task per server."""
@@ -628,11 +699,14 @@ class TelnetRelay:
                     self.handshake_sent[server_name] = True
 
                 if self._direction_allows_inbound(server_name):
-                    for client_writer in self.client_writers[:]:
-                        if client_writer.is_closing():
-                            continue
-                        await self._enqueue_client(client_writer, data, f'client {client_writer.get_extra_info("peername")}')
-                        logging.debug(f'Relayed data from server {server_name} to client')
+                    if self.rbn_aggregator:
+                        await self._process_rbn_data(server_name, data)
+                    else:
+                        for client_writer in self.client_writers[:]:
+                            if client_writer.is_closing():
+                                continue
+                            await self._enqueue_client(client_writer, data, f'client {client_writer.get_extra_info("peername")}')
+                            logging.debug(f'Relayed data from server {server_name} to client')
 
         except asyncio.TimeoutError:
             logging.error(f'No data from {server_name} for {self.server_timeout} seconds, reconnecting...')
@@ -656,6 +730,19 @@ class TelnetRelay:
                 logging.error(f'Status update task failed: {e}, restarting in 5 seconds')
                 await asyncio.sleep(5)
 
+    async def _rbn_flush_loop(self):
+        """Flush RBN dwell queues periodically so late timers still emit."""
+        while True:
+            try:
+                await asyncio.sleep(1)
+                if not self.rbn_aggregator:
+                    continue
+                outputs = self.rbn_aggregator.process_queue()
+                await self._deliver_lines_to_clients(outputs)
+            except Exception as e:
+                logging.error(f'RBN flush loop failed: {e}, restarting in 5 seconds')
+                await asyncio.sleep(5)
+
     async def start_relay(self):
         """Start the relay server and manage all connections."""
         logging.debug('Starting relay')
@@ -669,6 +756,8 @@ class TelnetRelay:
             self._start_connector(server_def)
 
         status_task = asyncio.create_task(self.send_status_to_clients())
+        if self.rbn_aggregator:
+            self.rbn_timer_task = asyncio.create_task(self._rbn_flush_loop())
 
         server = await asyncio.start_server(self.handle_client, '0.0.0.0', self.listen_port)
         logging.debug(f'Relay server started, listening on port {self.listen_port}')
@@ -678,6 +767,8 @@ class TelnetRelay:
                 await server.serve_forever()
         except asyncio.CancelledError:
             status_task.cancel()
+            if self.rbn_timer_task:
+                self.rbn_timer_task.cancel()
             raise
 
 if __name__ == "__main__":
@@ -700,7 +791,24 @@ if __name__ == "__main__":
     client_timeout = args.client_timeout if args.client_timeout > 0 else None
     server_timeout = args.server_timeout if args.server_timeout > 0 else None
 
+    rbn_config = {
+        'enabled': bool(args.rbn_dedupe),
+        'dwell_time': args.rbn_dwell,
+        'limbo_time': args.rbn_limbo,
+        'respot_time': args.rbn_respot,
+        'cache_time': args.rbn_limbo * 12,  # keep cache warm roughly an hour by default
+        'min_quality': args.rbn_minqual,
+        'max_quality': args.rbn_maxqual,
+        'search_khz': args.rbn_search_khz,
+        'max_deviants': args.rbn_max_deviants,
+    }
+
+    if args.rbn_trace:
+        rbn_config['trace_fn'] = lambda msg: logging.info(f"RBN {msg}")
+        if not args.rbn_dedupe:
+            logging.warning("--rbn-trace requested but --rbn-dedupe is not enabled")
+
     relay = TelnetRelay(server_definitions, notes, args.listen_port, args.callsign, args.login_prompt,
                         client_timeout=client_timeout, server_timeout=server_timeout,
-                        server_directions=server_directions)
+                        server_directions=server_directions, rbn_config=rbn_config)
     asyncio.run(relay.start_relay())

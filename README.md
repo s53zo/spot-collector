@@ -17,6 +17,7 @@ When the script receives specific prompts (e.g., “call:”, “sign:”, or �
 - **Client Commands:** Supports commands for checking status, reconnecting servers, listing connected clients, and viewing uptime.
 - **Customizable Callsign:** Sends a full callsign to the primary server while stripping the numeric suffix for secondary servers.
 - **SystemD Integration:** Easily run as a background service using the provided SystemD unit file.
+- **Optional RBN de-duplication:** With `--rbn-dedupe` enabled, incoming “DX de …” skimmer spots are aggregated with dwell/limbo logic similar to DXSpider’s RBN handling so only consolidated, quality-tagged spots are forwarded.
 
 ## Requirements
 
