@@ -27,6 +27,7 @@ class SpotRecord:
     respot: bool = False
     raw_line: str = ""
     qra: str = ""
+    upstream_quality: Optional[int] = None
 
 
 @dataclass
@@ -165,9 +166,28 @@ class RbnAggregator:
         strength = int(snr_str)
         if tokens and tokens[0].lower().startswith("db"):
             tokens = tokens[1:]
+        upstream_quality = None
+        # Extract upstream Q: scores (e.g., Q:9, Q:7+), keeping the numeric part for weighting.
+        new_tokens = []
+        for tok in tokens:
+            q_match = re.match(r"Q:?(\d)", tok, re.IGNORECASE)
+            if q_match:
+                upstream_quality = int(q_match.group(1))
+                continue
+            new_tokens.append(tok)
+        tokens = new_tokens
         rest = " ".join(tokens)
         utz = self._parse_time(rest, now)
-        return SpotRecord(origin=origin, freq=freq, call=call, mode=mode, strength=strength, utz=utz, raw_line=line)
+        return SpotRecord(
+            origin=origin,
+            freq=freq,
+            call=call,
+            mode=mode,
+            strength=strength,
+            utz=utz,
+            raw_line=line,
+            upstream_quality=upstream_quality,
+        )
 
     def ingest_line(self, line: str, now: Optional[float] = None) -> List[str]:
         """Feed one textual line; returns zero or more output lines to forward."""
@@ -254,7 +274,14 @@ class RbnAggregator:
             for rec in records:
                 sk_key = self._skimmer_key(rec.origin, rec.freq)
                 score = self.skimmers.setdefault(sk_key, SkimmerScore())
-                votes[rec.freq] += max(score.score, 0.1)
+                base_weight = max(score.score, 0.1)
+                if rec.upstream_quality:
+                    # Upstream Q tags: scale weight so Q:9 ~3x a normal skimmer.
+                    quality_multiplier = max(0.5, rec.upstream_quality / 3.0)
+                    weight = base_weight * quality_multiplier
+                else:
+                    weight = base_weight
+                votes[rec.freq] += weight
 
             if not votes:
                 self.queue.pop(sp, None)
