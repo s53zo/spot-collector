@@ -300,9 +300,9 @@ class RbnAggregator:
             if any(r.respot for r in records):
                 quality_tag += "+"
 
-            freq_str = f"{consensus_freq:9.1f}"
-            call_str = f"{best.call:<12.12}"
-            mode_str = f"{best.mode:<3.3}"
+            freq_str = f"{consensus_freq:.1f}"
+            call_str = f"{best.call:<13.13}"
+            mode_str = f"{best.mode:<4.4}"
             snr_str = f"{best.strength:>2d}dB"
             origin_out = best.origin.rstrip('-')
             zone_tokens = ["15"]  # local zone contribution
@@ -319,16 +319,23 @@ class RbnAggregator:
             zones = ",".join(zone_tokens) if zone_tokens else ""
             time_str = time.strftime("%H%MZ", time.gmtime(best.utz or now))
             origin_fmt = f"{origin_out}-#"
+            prefix = f"DX de {origin_fmt}:"
+            # Keep frequency right-aligned to the classic column that ends at index 23.
+            spaces_after_origin = max(0, 24 - len(prefix) - len(freq_str))
+            freq_field = f"{' ' * spaces_after_origin}{freq_str}"
             base = (
-                f"DX de {origin_fmt:<9} "
-                f"{consensus_freq:8.1f}  "
-                f"{best.call:<12}"
-                f" {best.mode:<3}"
-                f" {best.strength:>2}dB "
-                f"{quality_tag:<4}"
-                f" Z:{zones:<15}"
+                prefix
+                + freq_field
+                + "  "
+                + call_str
+                + mode_str
+                + snr_str
+                + " "
+                + quality_tag
+                + " "
+                + f"Z:{zones}"
             )
-            out_line = f"{base:<73}{time_str}"
+            out_line = f"{base:<70}{time_str}"
             outputs.append(out_line)
             trace_needed = bool(deviants)
             if trace_needed:
