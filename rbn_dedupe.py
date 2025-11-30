@@ -60,6 +60,7 @@ class RbnAggregator:
         search_khz: int = 5,
         max_deviants: int = 5,
         trace=None,
+        inrush_delay: int = 15,
     ) -> None:
         self.dwell_time = dwell_time
         self.limbo_time = limbo_time
@@ -69,11 +70,13 @@ class RbnAggregator:
         self.max_quality = max_quality
         self.search_khz = search_khz
         self.max_deviants = max_deviants
+        self.inrush_delay = inrush_delay
 
         self.spots: Dict[str, Dict[str, object]] = {}
         self.queue: Dict[str, int] = {}
         self.skimmers: Dict[str, SkimmerScore] = {}
         self._trace_fn = trace
+        self._start_time = self._now()
 
     @staticmethod
     def _now() -> float:
@@ -172,6 +175,10 @@ class RbnAggregator:
         record = self._parse_line(line, now)
         if not record:
             return [line]  # pass-through for non-RBN lines
+
+        # Warm-up period to avoid initial inrush flood
+        if self.inrush_delay and now - self._start_time < self.inrush_delay:
+            return []
 
         nqrg = int(round(record.freq * 10))
         sp, cand = self._find_existing_key(record.call, nqrg)
@@ -345,6 +352,10 @@ class RbnAggregator:
             if now - cand.get("ctime", now) > self.cache_time:
                 self.spots.pop(k, None)
                 self.queue.pop(k, None)
+        for k in list(self.skimmers.keys()):
+            score = self.skimmers[k]
+            if score.last_in and now - score.last_in > self.cache_time:
+                self.skimmers.pop(k, None)
 
         return outputs
 

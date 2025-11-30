@@ -65,6 +65,7 @@ def _create_parser(require_required_flags):
     parser.add_argument('--rbn-maxqual', dest='rbn_maxqual', type=int, default=9, help="Maximum quality value (default: 9)")
     parser.add_argument('--rbn-search-khz', dest='rbn_search_khz', type=int, default=5, help="Frequency search window in kHz around the normalized key (default: 5)")
     parser.add_argument('--rbn-max-deviants', dest='rbn_max_deviants', type=int, default=5, help="Number of deviant frequency deltas to remember per skimmer (default: 5)")
+    parser.add_argument('--rbn-inrush', dest='rbn_inrush', type=int, default=15, help="Warm-up delay in seconds before emitting RBN spots (default: 15)")
     parser.add_argument('--rbn-trace', dest='rbn_trace', action='store_true', help="Print basic RBN de-duplication steps to the console for testing")
     return parser
 
@@ -231,6 +232,7 @@ class TelnetRelay:
                 max_quality=rbn_config.get('max_quality', 9),
                 search_khz=rbn_config.get('search_khz', 5),
                 max_deviants=rbn_config.get('max_deviants', 5),
+                inrush_delay=rbn_config.get('inrush_delay', 300),
                 trace=rbn_config.get('trace_fn'),
             )
             logging.info("RBN de-duplication enabled")
@@ -801,6 +803,7 @@ if __name__ == "__main__":
         'max_quality': args.rbn_maxqual,
         'search_khz': args.rbn_search_khz,
         'max_deviants': args.rbn_max_deviants,
+        'inrush_delay': args.rbn_inrush,
     }
 
     if args.rbn_trace:
