@@ -319,9 +319,16 @@ class RbnAggregator:
             zones = ",".join(zone_tokens) if zone_tokens else ""
             time_str = time.strftime("%H%MZ", time.gmtime(best.utz or now))
             origin_fmt = f"{origin_out}-#:"
-            # Build aligned fields similar to classic DXSpider formatting
-            base = f"DX de {origin_fmt:<10} {freq_str}  {call_str} {mode_str} {snr_str} {quality_tag:<4} Z:{zones}"
-            out_line = f"{base:<70}{time_str}"
+            base = (
+                f"DX de {origin_fmt:<10}"
+                f"{consensus_freq:10.1f}  "
+                f"{best.call:<12}"
+                f" {best.mode:<3}"
+                f" {best.strength:>3}dB "
+                f"{quality_tag:<5}"
+                f"Z:{zones}"
+            )
+            out_line = f"{base:<76}{time_str}"
             outputs.append(out_line)
             trace_needed = bool(deviants)
             if trace_needed:
