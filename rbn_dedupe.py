@@ -320,15 +320,15 @@ class RbnAggregator:
             time_str = time.strftime("%H%MZ", time.gmtime(best.utz or now))
             origin_fmt = f"{origin_out}-#:"
             base = (
-                f"DX de {origin_fmt:<10}"
-                f"{consensus_freq:10.1f}  "
-                f"{best.call:<12}"
+                f"DX de {origin_fmt:<11}"
+                f"{consensus_freq:9.1f}  "
+                f"{best.call:<11}"
                 f" {best.mode:<3}"
                 f" {best.strength:>3}dB "
-                f"{quality_tag:<5}"
-                f"Z:{zones}"
+                f"{quality_tag:<4}"
+                f" Z:{zones:<14}"
             )
-            out_line = f"{base:<76}{time_str}"
+            out_line = f"{base:<72}{time_str}"
             outputs.append(out_line)
             trace_needed = bool(deviants)
             if trace_needed:
