@@ -83,7 +83,7 @@ Run the script using the following required arguments:
    ```json
    {
      "listen_port": 8000,
-     "callsign": "S53M-23",
+     "callsign": "CALLSIGN-X",
      "login_prompt": "login: ",
      "client_timeout": 0,
      "server_timeout": 0,
