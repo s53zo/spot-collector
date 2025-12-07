@@ -70,7 +70,7 @@ Run the script using the following required arguments:
      --server3 10.0.10.104:7300 \
      --server4 10.0.10.154:7373 \
      --listen-port 8000 \
-     --callsign S53M-23 \
+     --callsign CALLSIGN-X \
      --note1 "S50DXS" \
      --note2 "Local Skimmer 1" \
      --note3 "Local Skimmer 2" \
