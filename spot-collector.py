@@ -57,7 +57,7 @@ def _create_parser(require_required_flags):
                         help="Optional inactivity timeout (seconds) for client connections; 0 disables the timeout")
     parser.add_argument('--server-timeout', dest='server_timeout', type=int, default=0,
                         help="Optional inactivity timeout (seconds) for upstream server connections; 0 disables the timeout")
-    parser.add_argument('--rbn-dedupe', dest='rbn_dedupe', action='store_true', help="Enable RBN-style de-duplication (aggregates DX de lines across skimmers)")
+    parser.add_argument('--rbn-dedupe', dest='rbn_dedupe', action='store_true', help="Enable RBN-style de-duplication for non-primary servers (aggregates DX de lines across skimmers)")
     parser.add_argument('--rbn-dwell', dest='rbn_dwell', type=int, default=10, help="RBN dwell time in seconds (default: 10)")
     parser.add_argument('--rbn-limbo', dest='rbn_limbo', type=int, default=300, help="RBN limbo timeout in seconds (default: 300)")
     parser.add_argument('--rbn-respot', dest='rbn_respot', type=int, default=180, help="RBN respot suppression window in seconds (default: 180)")
@@ -235,7 +235,7 @@ class TelnetRelay:
                 inrush_delay=rbn_config.get('inrush_delay', 300),
                 trace=rbn_config.get('trace_fn'),
             )
-            logging.info("RBN de-duplication enabled")
+            logging.info("RBN de-duplication enabled for non-primary servers; primary server passes through spots")
         else:
             logging.info("RBN de-duplication disabled")
         logging.debug(f'TelnetRelay initialized with servers: {self.server_definitions}, listen_port: {listen_port}, '
@@ -250,6 +250,10 @@ class TelnetRelay:
     def _direction_allows_inbound(self, server_name):
         direction = self.server_directions.get(server_name, 'both')
         return direction in ('in', 'both')
+
+    def _should_apply_rbn(self, server_name):
+        """Apply RBN aggregation only to non-primary servers."""
+        return bool(self.rbn_aggregator) and server_name != self.primary_server_name
 
     async def _deliver_lines_to_clients(self, lines):
         """Send already-deduped textual lines to all clients."""
@@ -701,7 +705,7 @@ class TelnetRelay:
                     self.handshake_sent[server_name] = True
 
                 if self._direction_allows_inbound(server_name):
-                    if self.rbn_aggregator:
+                    if self._should_apply_rbn(server_name):
                         await self._process_rbn_data(server_name, data)
                     else:
                         for client_writer in self.client_writers[:]:
