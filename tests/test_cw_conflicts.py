@@ -48,6 +48,58 @@ class CwConflictTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertTrue(all(b' S53ZO ' in raw for raw in selected))
 
+    def replay_s53f(self, earlier_reports=False):
+        # Operator-supplied excerpts in wire order. The monitor shows UTC
+        # minutes only. One second between rows keeps their order explicit.
+        groups = [
+            ('1938', [('E28AC', 3521.9, 'S53F', 11), ('DO4DXA', 3522.0, 'S53F', 43),
+                      ('DL0TRZ', 3522.1, 'S53E', 13), ('EA1DAV', 3522.0, 'S53F', 19)]),
+            ('1952', [('DL1HWS', 3522.0, 'S53F', 37), ('G0KTN', 3522.0, 'S53F', 25),
+                      ('LA6TPA', 3522.0, 'S53U', 6), ('OE6ADD', 3522.0, 'S53F', 38)]),
+            ('1958', [('EI4HQ', 3522.0, 'S53F', 34), ('SM0ECF', 3522.0, 'S53F', 31),
+                      ('HS0ZGZ', 3522.0, 'S53I', 5), ('G4IRN', 3522.1, 'S53F', 33)]),
+            ('2005', [('DL0TRZ', 3522.0, 'S53F', 13), ('IK7YTT', 3522.0, 'S53F', 46),
+                      ('SZ1A', 3521.9, 'S53FS', 32), ('F4BPO', 3522.0, 'S53F', 2)]),
+            ('2012', [('F4GOU', 3522.0, 'S53F', 36), ('EA2CW', 3522.0, 'S53F', 5),
+                      ('OH4KA', 3522.0, 'S53U', 25), ('DK0KK', 3522.0, 'S53F', 29)]),
+        ]
+        if earlier_reports:
+            # Both skimmers reported S53F on 3522.0 during the prior minute
+            # in the contest recording. Either supplies the missing second vote.
+            self.now += 70
+            self.send('IW9GDC-#', 'S53F', 3522.0)
+            self.now += 1
+            self.send('LZ3CB-#', 'S53F', 3522.0)
+        selected, held = [], []
+        midnight = self.now - self.now % 86400
+        for stamp, group in groups:
+            minute = int(stamp[:2]) * 60 + int(stamp[2:])
+            for second, (rx, frequency, call, snr) in enumerate(group):
+                self.now = midnight + minute * 60 + second
+                outputs = self.send(rx + '-#', call, frequency, comment='CW %d dB' % snr)
+                selected.extend(raw.split()[4].decode() for raw in outputs)
+                if self.engine.last_evaluation.get('reason') == 'cw-conflict-unconfirmed':
+                    held.append((stamp, call))
+        return selected, held
+
+    def test_s53f_contest_excerpts(self):
+        selected, held = self.replay_s53f()
+        self.assertEqual(selected.count('S53F'), 5)
+        for incident in [('1952', 'S53U'), ('1958', 'S53I'), ('2005', 'S53FS'), ('2012', 'S53U')]:
+            self.assertIn(incident, held)
+
+    @unittest.expectedFailure
+    def test_s53e_at_edge_of_sparse_s53f_run(self):
+        # Only DO4DXA is within 100 Hz of DL0TRZ before S53E arrives.
+        selected, _ = self.replay_s53f()
+        self.assertNotIn('S53E', selected)
+
+    def test_s53f_contest_excerpts_with_prior_minute_evidence(self):
+        selected, held = self.replay_s53f(earlier_reports=True)
+        self.assertEqual(set(selected), {'S53F'})
+        self.assertEqual(held, [('1938', 'S53E'), ('1952', 'S53U'), ('1958', 'S53I'),
+                                ('2005', 'S53FS'), ('2012', 'S53U')])
+
     def test_contest_singletons_and_adjacent_confirmed_call(self):
         self.occupy()
         for call in ('S53GO', 'S53M', 'S53N', 'S53ZX', 'S53ZM'):
