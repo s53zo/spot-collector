@@ -1,23 +1,25 @@
 import argparse
 import asyncio
 import contextlib
-from collections import deque
+from collections import Counter
 import json
 import logging
+from pathlib import Path
 import random
 import re
 import socket
 import time
 
-from rbn_dedupe import RbnAggregator
+from spot_processing import SpotProcessor, parse_spot
+from status_report import format_status
+from stream_protocol import LineFramer, TelnetDecoder, ProtocolError, login_prompt, encode_telnet
 
 RECONNECT_INTERVAL = 300  # 5 minutes max delay for reconnect attempts
 STATUS_INTERVAL = 300     # 5 minutes between status updates
 DRAIN_TIMEOUT = 5         # Seconds to wait on a drain before giving up
-DEFAULT_SERVER_TIMEOUT = 300  # Seconds without data before considering an upstream stalled
 
 def configure_logging(debug_enabled):
-    """Configure root logger to emit to stdout."""
+    """Configure console logging; verbose spot traces use the same handlers."""
     if logging.getLogger().handlers:
         # Respect existing configuration
         return
@@ -52,21 +54,24 @@ def _create_parser(require_required_flags):
     parser.add_argument('--note3', type=str, help="Note for the third server")
     parser.add_argument('--note4', type=str, help="Note for the fourth server")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
+    parser.add_argument('--debug-verbose', dest='debug_verbose', action='store_true',
+                        help="Log each spot with same-line decision details; does not modify client output")
     parser.add_argument('--login-prompt', dest='login_prompt', type=str, default="login: ", help="Login prompt to send to clients upon connection (default: 'login: ')")
     parser.add_argument('--client-timeout', dest='client_timeout', type=int, default=0,
                         help="Optional inactivity timeout (seconds) for client connections; 0 disables the timeout")
     parser.add_argument('--server-timeout', dest='server_timeout', type=int, default=0,
                         help="Optional inactivity timeout (seconds) for upstream server connections; 0 disables the timeout")
-    parser.add_argument('--rbn-dedupe', dest='rbn_dedupe', action='store_true', help="Enable RBN-style de-duplication for non-primary servers (aggregates DX de lines across skimmers)")
-    parser.add_argument('--rbn-dwell', dest='rbn_dwell', type=int, default=10, help="RBN dwell time in seconds (default: 10)")
-    parser.add_argument('--rbn-limbo', dest='rbn_limbo', type=int, default=300, help="RBN limbo timeout in seconds (default: 300)")
-    parser.add_argument('--rbn-respot', dest='rbn_respot', type=int, default=180, help="RBN respot suppression window in seconds (default: 180)")
-    parser.add_argument('--rbn-minqual', dest='rbn_minqual', type=int, default=2, help="Minimum skimmer count before emitting a spot (default: 2)")
-    parser.add_argument('--rbn-maxqual', dest='rbn_maxqual', type=int, default=9, help="Maximum quality value (default: 9)")
-    parser.add_argument('--rbn-search-khz', dest='rbn_search_khz', type=int, default=5, help="Frequency search window in kHz around the normalized key (default: 5)")
-    parser.add_argument('--rbn-max-deviants', dest='rbn_max_deviants', type=int, default=5, help="Number of deviant frequency deltas to remember per skimmer (default: 5)")
-    parser.add_argument('--rbn-inrush', dest='rbn_inrush', type=int, default=15, help="Warm-up delay in seconds before emitting RBN spots (default: 15)")
-    parser.add_argument('--rbn-trace', dest='rbn_trace', action='store_true', help="Print basic RBN de-duplication steps to the console for testing")
+    parser.add_argument('--rbn-dedupe', dest='rbn_dedupe', action='store_true', help="Deprecated compatibility flag; source-aware processing is enabled by default")
+    parser.add_argument('--rbn-dwell', dest='rbn_dwell', type=int, default=10, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-limbo', dest='rbn_limbo', type=int, default=300, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-respot', dest='rbn_respot', type=int, default=180, help="Compatibility alias for spot_processing.repeat_seconds (default: 180)")
+    parser.add_argument('--rbn-minqual', dest='rbn_minqual', type=int, default=2, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-maxqual', dest='rbn_maxqual', type=int, default=9, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-search-khz', dest='rbn_search_khz', type=int, default=5, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-max-deviants', dest='rbn_max_deviants', type=int, default=5, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-inrush', dest='rbn_inrush', type=int, default=15, help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--rbn-trace', dest='rbn_trace', action='store_true', help="Deprecated; accepted but unused by source-aware processing")
+    parser.add_argument('--spot-processing', type=json.loads, default={}, help="JSON object of source-aware processing settings")
     return parser
 
 def parse_arguments():
@@ -117,12 +122,19 @@ def parse_arguments():
                 parser.error(f'Invalid direction for {name.replace("_", " ")}: {direction_value}. '
                              f'Use one of {", ".join(sorted(valid_directions))}.')
 
+        if not isinstance(defaults.spot_processing, dict):
+            parser.error('spot_processing must be a JSON object')
+
+        if not isinstance(defaults.debug_verbose, bool):
+            parser.error('debug_verbose must be a boolean')
         defaults.config = config_args.config
         defaults.servers_config_list = servers_config_list
         return defaults
 
     parser = _create_parser(require_required_flags=True)
     args = parser.parse_args()
+    if not isinstance(args.spot_processing, dict):
+        parser.error('spot_processing must be a JSON object')
     args.config = None
     args.servers_config_list = None
     return args
@@ -172,12 +184,7 @@ def build_server_definitions(args):
             note = entry.get('note', '')
             default_direction = 'both' if idx == 0 else 'in'
             direction = _normalize_direction(entry.get('direction'), default_direction)
-            server_definitions.append({
-                'name': name,
-                'address': address,
-                'note': note,
-                'direction': direction
-            })
+            server_definitions.append(dict(entry, name=name, address=address, note=note, direction=direction))
     else:
         legacy_servers = [
             ('Server1', args.server1, args.note1, args.server1_direction, 'both'),
@@ -197,10 +204,70 @@ def build_server_definitions(args):
     if not server_definitions:
         raise ValueError('At least one server must be configured.')
 
+    seen = set()
+    for idx, server in enumerate(server_definitions):
+        name = server['name']
+        if not isinstance(name, str) or not name or name.lower() in seen:
+            raise ValueError('Server names must be nonempty and unique')
+        seen.add(name.lower())
+        if not isinstance(server.get('enabled', True), bool):
+            raise ValueError('enabled must be true or false')
+        if not isinstance(server['address'], str):
+            raise ValueError('Server address must be a string')
+        host, port = server['address'].rsplit(':', 1)
+        if not host or not 1 <= int(port) <= 65535:
+            raise ValueError('Server address must contain a host and valid port')
+        role = server.setdefault('role', 'cluster' if idx == 0 else 'local')
+        if role == 'local' and host.lower().rstrip('.') == 'telnet.reversebeacon.net':
+            role = server['role'] = 'rbn'
+            logging.warning('Source %s is public RBN; treating local role as rbn so receivers are not pooled', name)
+        if role not in ('cluster', 'local', 'gocluster', 'rbn'):
+            raise ValueError('Server role must be cluster, local, gocluster or rbn')
+        if role in ('gocluster', 'rbn') and server['direction'] != 'in':
+            raise ValueError('GoCluster and RBN sources must have direction in')
+        for value in (server.get('callsign'),):
+            if value is not None and (not isinstance(value, str) or not value or len(value) > 64 or not value.isascii() or any(c.isspace() for c in value)):
+                raise ValueError('Per-server callsign must be one token of at most 64 characters')
+        settings_file = server.get('settings_file')
+        if settings_file is not None:
+            if not isinstance(settings_file, str) or not settings_file:
+                raise ValueError('settings_file must be a nonempty path')
+            if 'startup_commands' in server:
+                raise ValueError('Use settings_file or startup_commands, not both')
+            base = Path(args.config).resolve().parent if getattr(args, 'config', None) else Path.cwd()
+            path = base / settings_file
+            try:
+                with path.open('rb') as settings:
+                    payload = settings.read(16385)
+                if len(payload) > 16384:
+                    raise ValueError('settings_file exceeds 16384 bytes')
+                if any(byte < 32 and byte not in (10, 13) or byte > 126 for byte in payload):
+                    raise ValueError('settings_file must contain printable ASCII commands and line endings')
+                text = payload.decode('ascii')
+            except (OSError, UnicodeError) as exc:
+                raise ValueError('Unable to read settings_file %s: %s' % (path, exc)) from exc
+            commands = [line.strip() for line in text.splitlines()
+                        if line.strip() and not line.lstrip().startswith('#')]
+            if any(any(ord(char) < 32 or ord(char) > 126 for char in line) for line in commands):
+                raise ValueError('settings_file commands must be printable ASCII')
+            server['startup_commands'] = commands
+        commands = server.get('startup_commands', [])
+        if not isinstance(commands, list) or len(commands) > 16 or any(not isinstance(c, str) or len(c) > 512 or '\n' in c or '\r' in c for c in commands):
+            raise ValueError('startup_commands must contain at most 16 single-line commands')
+        ready = server.get('ready_text', '')
+        if not isinstance(ready, str) or len(ready) > 256:
+            raise ValueError('ready_text must be a string of at most 256 characters')
+        if commands and not ready:
+            raise ValueError('startup_commands require explicit ready_text from the server greeting')
     return server_definitions
 
 class TelnetRelay:
-    def __init__(self, server_definitions, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None, server_directions=None, rbn_config=None):
+    def __init__(self, server_definitions, notes, listen_port, callsign, login_prompt, client_timeout=None, server_timeout=None, server_directions=None, rbn_config=None, processing_config=None, debug_verbose=False):
+        if not isinstance(debug_verbose, bool):
+            raise ValueError('debug_verbose must be a boolean')
+        self.debug_verbose = debug_verbose
+        self.source_spot_counts = {item['name']: Counter() for item in server_definitions}
+        self.last_spot_times = {item['name']: None for item in server_definitions}
         self.server_definitions = server_definitions
         self.notes = notes
         self.listen_port = listen_port
@@ -215,103 +282,54 @@ class TelnetRelay:
         self.handshake_sent = {}
         self.start_time = time.time()  # Track when the server started
         self.client_timeout = client_timeout
-        self.server_timeout = server_timeout if server_timeout is not None else DEFAULT_SERVER_TIMEOUT
+        self.server_timeout = server_timeout if server_timeout and server_timeout > 0 else None
         self.server_directions = server_directions or {}
-        self.server_message_times = {server['name']: deque() for server in self.server_definitions}
         self.primary_server_name = self.server_definitions[0]['name']
-        self.server_buffers = {server['name']: '' for server in self.server_definitions}
-        self.rbn_timer_task = None
-        self.rbn_aggregator = None
-        if rbn_config and rbn_config.get('enabled'):
-            self.rbn_aggregator = RbnAggregator(
-                dwell_time=rbn_config.get('dwell_time', 10),
-                limbo_time=rbn_config.get('limbo_time', 300),
-                respot_time=rbn_config.get('respot_time', 180),
-                cache_time=rbn_config.get('cache_time', 3600),
-                min_quality=rbn_config.get('min_quality', 2),
-                max_quality=rbn_config.get('max_quality', 9),
-                search_khz=rbn_config.get('search_khz', 5),
-                max_deviants=rbn_config.get('max_deviants', 5),
-                inrush_delay=rbn_config.get('inrush_delay', 300),
-                trace=rbn_config.get('trace_fn'),
-            )
-            logging.info("RBN de-duplication enabled for non-primary servers; primary server passes through spots")
-        else:
-            logging.info("RBN de-duplication disabled")
-        logging.debug(f'TelnetRelay initialized with servers: {self.server_definitions}, listen_port: {listen_port}, '
-                      f'callsign: {callsign}, notes: {notes}, login_prompt: {login_prompt}, '
-                      f'client_timeout: {client_timeout}, server_timeout: {server_timeout}, '
-                      f'server_directions: {self.server_directions}, rbn_enabled: {bool(self.rbn_aggregator)}')
+        self.server_definitions_by_name = {item['name']: item for item in server_definitions}
+        self.streams = {}
+        self.cleanup_tasks = set()
+        self.reconnect_events = {item['name']: asyncio.Event() for item in server_definitions}
+        self.client_handlers = set()
+        self.client_drop_count = 0
+        self.history_until = 0.0
+        self.history_remaining = 0
+        self.stopping = False
+        self.listener = None
+        self.local_call_release_task = None
+        if processing_config is not None and not isinstance(processing_config, dict):
+            raise ValueError('spot_processing must be an object')
+        self.processing_config = dict(processing_config) if processing_config is not None else {}
+        if rbn_config and 'respot_time' in rbn_config:
+            self.processing_config.setdefault('repeat_seconds', rbn_config['respot_time'])
+        self.processor = SpotProcessor(self.processing_config)
 
     def _direction_allows_outbound(self, server_name):
-        direction = self.server_directions.get(server_name, 'both')
+        source = self.server_definitions_by_name[server_name]
+        if source.get('role') in ('gocluster', 'rbn'):
+            return False
+        direction = self.server_directions.get(server_name, source.get('direction', 'both'))
         return direction in ('out', 'both')
 
     def _direction_allows_inbound(self, server_name):
-        direction = self.server_directions.get(server_name, 'both')
+        source = self.server_definitions_by_name[server_name]
+        direction = self.server_directions.get(server_name, source.get('direction', 'both'))
         return direction in ('in', 'both')
 
-    def _should_apply_rbn(self, server_name):
-        """Apply RBN aggregation only to non-primary servers."""
-        return bool(self.rbn_aggregator) and server_name != self.primary_server_name
-
     async def _deliver_lines_to_clients(self, lines):
-        """Send already-deduped textual lines to all clients."""
-        if not lines:
-            return
-        payloads = [f"{line}\r\n".encode() for line in lines]
-        for client_writer in self.client_writers[:]:
-            if client_writer.is_closing():
-                continue
-            peer = client_writer.get_extra_info('peername')
-            for payload in payloads:
-                await self._enqueue_client(client_writer, payload, f'client {peer}')
-                logging.debug(f'Relayed RBN line to client {peer}: {payload!r}')
-
-    def _iter_server_status(self):
-        for server_def in self.server_definitions:
-            name = server_def['name']
-            connection = self.server_connections.get(name)
-            address = connection[2] if connection else server_def['address']
-            alive = connection[3] if connection else False
-            connected_at = connection[4] if connection else None
-            note = self.notes.get(name, server_def.get('note', ''))
-            direction = self.server_directions.get(name, server_def.get('direction', 'both'))
-            yield name, address, alive, note, direction, connected_at
-
-    def _record_server_message(self, server_name):
-        """Track timestamps of inbound messages for simple rate calculation."""
-        timestamps = self.server_message_times.get(server_name)
-        if timestamps is None:
-            return
-        now = time.time()
-        cutoff = now - 900  # 15 minutes
-        timestamps.append(now)
-        while timestamps and timestamps[0] < cutoff:
-            timestamps.popleft()
-
-    def _compute_rate_per_hour(self, server_name):
-        """Compute per-hour rate based on the last 15 minutes of messages."""
-        timestamps = self.server_message_times.get(server_name)
-        if not timestamps:
-            return '-'
-        now = time.time()
-        cutoff = now - 900
-        while timestamps and timestamps[0] < cutoff:
-            timestamps.popleft()
-        # Scale 15-minute count to per-hour rate
-        rate = (len(timestamps) * 4)
-        return f'{rate}'
+        for line in lines:
+            payload = line + b'\r\n'
+            for writer in self.client_writers[:]:
+                await self._enqueue_client(writer, payload, 'client')
 
     async def _write_with_timeout(self, writer, data, context):
-        """Write to a stream with a timeout to avoid stalling on slow peers."""
+        """Write Telnet application bytes with a bounded drain."""
         if writer.is_closing():
             return False
-        writer.write(data)
         try:
+            writer.write(encode_telnet(data))
             await asyncio.wait_for(writer.drain(), timeout=DRAIN_TIMEOUT)
             return True
-        except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError) as exc:
+        except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
             logging.error(f'Write to {context} failed or timed out: {exc}')
             return False
 
@@ -323,13 +341,14 @@ class TelnetRelay:
         try:
             queue.put_nowait(data)
         except asyncio.QueueFull:
+            self.client_drop_count += 1
             logging.error(f'Client {context} send queue full; disconnecting')
             await self._cleanup_client(writer)
 
     async def _client_sender(self, writer, queue, context):
         """Serialize writes to a client so one slow client cannot block others."""
         try:
-            while True:
+            while not self.stopping and not writer.is_closing():
                 data = await queue.get()
                 if data is None:
                     break
@@ -339,22 +358,61 @@ class TelnetRelay:
         finally:
             await self._cleanup_client(writer)
 
+    async def _close_writer(self, writer):
+        """Join graceful close, forcing transport retirement if draining stalls."""
+        if writer is None:
+            return
+        waiter = None
+        transport = getattr(writer, 'transport', None)
+        try:
+            writer.close()
+            waiter = asyncio.ensure_future(writer.wait_closed())
+            try:
+                # wait_closed shares its protocol future. A timeout must not
+                # cancel that future before abort can publish connection_lost.
+                await asyncio.wait_for(asyncio.shield(waiter), DRAIN_TIMEOUT)
+                return
+            except (asyncio.TimeoutError, OSError, RuntimeError):
+                if transport is not None:
+                    transport.abort()
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), min(DRAIN_TIMEOUT, 1))
+                except (asyncio.TimeoutError, OSError, RuntimeError):
+                    pass
+        except asyncio.CancelledError:
+            if transport is not None:
+                transport.abort()
+            raise
+        except (OSError, RuntimeError):
+            if transport is not None:
+                transport.abort()
+        finally:
+            if waiter is not None:
+                if not waiter.done():
+                    waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
     async def _cleanup_client(self, writer):
-        """Remove client state and close the connection."""
-        current = asyncio.current_task()
-        task = self.client_sender_tasks.pop(writer, None)
-        if task is not None and task is not current and not task.done():
+        task = self.client_sender_tasks.get(writer)
+        if task is asyncio.current_task():
+            self.client_sender_tasks.pop(writer, None)
+        elif task is not None:
             task.cancel()
-        queue = self.client_queues.pop(writer, None)
-        if queue is not None:
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(None)
+            task.add_done_callback(lambda done: self.client_sender_tasks.pop(writer, None) if self.client_sender_tasks.get(writer) is done else None)
+        self.client_queues.pop(writer, None)
         if writer in self.client_writers:
             self.client_writers.remove(writer)
-        if writer and not writer.is_closing():
+        # Removal and close are immediate; the bounded join cannot block fanout.
+        if not writer.is_closing():
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+            if len(self.cleanup_tasks) < 128:
+                close_task = asyncio.create_task(self._close_writer(writer))
+                self.cleanup_tasks.add(close_task)
+                close_task.add_done_callback(self.cleanup_tasks.discard)
+            else:
+                transport = getattr(writer, 'transport', None)
+                if transport is not None:
+                    transport.abort()
 
     def _enable_tcp_keepalive(self, writer, context):
         """Enable TCP keepalive on the provided writer's socket when possible."""
@@ -381,273 +439,291 @@ class TelnetRelay:
         except OSError as e:
             logging.debug(f'Failed to enable TCP keepalive for {context}: {e}')
 
-    @staticmethod
-    def _strip_telnet_control(data):
-        """Remove Telnet negotiation sequences (IAC commands) from a byte stream."""
-        result = bytearray()
-        i = 0
-        length = len(data)
-        while i < length:
-            byte = data[i]
-            if byte == 255:  # IAC
-                if i + 1 >= length:
-                    break
-                command = data[i + 1]
-                if command in (251, 252, 253, 254):  # WILL/WONT/DO/DONT + option byte
-                    i += 3
-                    continue
-                if command == 250:  # SB ... IAC SE
-                    i += 2
-                    while i < length:
-                        if data[i] == 255 and i + 1 < length and data[i + 1] == 240:
-                            i += 2
-                            break
-                        i += 1
-                    continue
-                if command == 255:  # Escaped IAC
-                    result.append(255)
-                    i += 2
-                    continue
-                i += 2
-                continue
-            result.append(byte)
-            i += 1
-        return bytes(result)
+    async def _process_server_line(self, name, line):
+        if not self._direction_allows_inbound(name):
+            return
+        # Retire expired holds before new input can supply late authority.
+        await self._drain_local_call_holds()
+        source = self.server_definitions_by_name[name]
+        history = (name == self.primary_server_name and
+                   time.monotonic() < self.history_until and self.history_remaining > 0)
+        if history and line.upper().startswith(b'DX DE '):
+            self.history_remaining -= 1
+        elif history and line.rstrip().endswith(b'>'):
+            self.history_remaining = 0
+        role = source.get('role', 'cluster' if name == self.primary_server_name else 'local')
+        before = dict(getattr(self.processor, 'counts', {}))
+        outputs = self.processor.process(name, role, line, history=history)
+        after = getattr(self.processor, 'counts', {})
+        delta = {key: value - before.get(key, 0) for key, value in after.items()}
+        await self._record_spot_result(name, role, line, outputs, delta, history)
+        # New external evidence can settle a local hold before its deadline.
+        await self._drain_local_call_holds()
 
-    async def _process_rbn_data(self, server_name, data):
-        """Decode inbound data into lines, feed the RBN aggregator, and fan out results."""
-        if not self.rbn_aggregator:
-            return
-        cleaned = self._strip_telnet_control(data)
-        try:
-            text = cleaned.decode('utf-8', errors='ignore')
-        except Exception:
-            return
-        if '\n' not in text and '\r' not in text:
-            # Likely a prompt or partial line; forward as-is so logins are not blocked.
-            self.server_buffers[server_name] = ''
-            for client_writer in self.client_writers[:]:
-                if client_writer.is_closing():
-                    continue
-                await self._enqueue_client(client_writer, data, f'client {client_writer.get_extra_info("peername")}')
-            return
-        buffer = self.server_buffers.get(server_name, '')
-        text = buffer + text
-        lines = text.splitlines()
-        if text and text[-1] not in ('\n', '\r'):
-            self.server_buffers[server_name] = lines.pop()
-        else:
-            self.server_buffers[server_name] = ''
-        outputs = []
-        for line in lines:
-            outputs.extend(self.rbn_aggregator.ingest_line(line))
+    async def _record_spot_result(self, name, role, line, outputs, delta,
+                                  history=False, evaluation=None, observed=True):
+        metrics = self.source_spot_counts[name]
+        for field, counter in (('parsed', 'parsed_spots'), ('forwarded', 'delivered_spots'),
+                               ('repeats', 'suppressed_repeats'), ('held', 'local_call_held')):
+            metrics[field] += delta.get(counter, 0)
+        metrics['rejected'] += sum(delta.get(key, 0) for key in
+                                  ('stale_spots', 'out_of_order_spots', 'undated_frequency_conflicts'))
+        is_spot = bool(re.match(rb'^DX\s+de\s', line, re.I))
+        if is_spot and observed:
+            self.last_spot_times[name] = time.monotonic()
+        if self.debug_verbose and is_spot:
+            self._log_spot_decision(name, role, line, outputs, delta, history,
+                                    evaluation=evaluation)
         await self._deliver_lines_to_clients(outputs)
+
+    async def _drain_local_call_holds(self, force=False):
+        drain = getattr(self.processor, 'drain_local_holds', None)
+        if drain is None:
+            return
+        for event in drain(force=force):
+            name = event['source']
+            if name not in self.server_definitions_by_name:
+                logging.warning('Discarded local call release for unknown source %s', name)
+                continue
+            role = self.server_definitions_by_name[name].get('role', 'local')
+            await self._record_spot_result(name, role, event['input'], event['outputs'],
+                                           event['delta'], evaluation=event['evaluation'],
+                                           observed=False)
+
+    async def _local_call_release_loop(self):
+        while not self.stopping:
+            await asyncio.sleep(.25)
+            await self._drain_local_call_holds()
+
+    async def _process_rbn_data(self, name, data):
+        # Compatibility entry point: it now processes all source roles equally.
+        decoder, framer = self.streams.setdefault(name, (TelnetDecoder(), LineFramer(cluster_prompts=True)))
+        for line in framer.feed(decoder.feed(data)):
+            await self._process_server_line(name, line)
 
     def _start_connector(self, server_def, force_restart=False):
         """Ensure a single connector task per server."""
         name = server_def['name']
         task = self.connector_tasks.get(name)
         if task and not task.done():
-            if not force_restart:
-                return
-            task.cancel()
+            if force_restart:
+                self.reconnect_events[name].set()
+            return
         self.connector_tasks[name] = asyncio.create_task(self._maintain_connection(server_def))
 
     async def _maintain_connection(self, server_def):
-        """Maintain a single connection task per server with bounded backoff."""
         name = server_def['name']
-        address, port = server_def['address'].split(':')
+        host, port = server_def['address'].rsplit(':', 1)
+        host = host.strip('[]')
         delay = 1
-        while True:
+        while not self.stopping:
+            writer = None
             try:
                 async with self.server_locks[name]:
-                    logging.debug(f'Connecting to {name} at {address}:{port}')
-                    reader, writer = await asyncio.open_connection(address, int(port))
-                    logging.debug(f'Connected to {name} at {address}:{port}')
-                    self.server_connections[name] = (reader, writer, f'{address}:{port}', True, time.time())
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), 30)
+                    self.server_connections[name] = (reader, writer, server_def['address'], True, time.time())
                     self.handshake_sent[name] = False
-                    self._enable_tcp_keepalive(writer, f'server connection {name}')
-                delay = 1  # reset backoff on success
+                    self.processor.reset_source(name)
+                    if name == self.primary_server_name:
+                        self.history_remaining = 0
+                    self.streams[name] = (TelnetDecoder(), LineFramer(cluster_prompts=True))
+                    self._enable_tcp_keepalive(writer, 'server ' + name)
                 await self.relay_server_data(reader, writer, name)
+                if self.handshake_sent.get(name):
+                    delay = 1
             except asyncio.CancelledError:
-                logging.debug(f'Connector for {name} cancelled')
-                break
-            except Exception as e:
-                logging.error(f'Error connecting to server {address}:{port} - {e}')
+                raise
+            except (OSError, ValueError, asyncio.TimeoutError) as exc:
+                logging.error('Upstream %s disconnected: %s', name, exc)
             finally:
-                connection = self.server_connections.get(name)
-                if connection and connection[1] and not connection[1].is_closing():
-                    connection[1].close()
-                    with contextlib.suppress(Exception):
-                        await connection[1].wait_closed()
-                self.server_connections[name] = (None, None, f'{address}:{port}', False, None)
-                self.handshake_sent[name] = False
-            sleep_for = min(delay, RECONNECT_INTERVAL) + random.uniform(0, 1)
-            logging.debug(f'Retrying connection to server {name} in {sleep_for:.1f} seconds')
-            await asyncio.sleep(sleep_for)
-            delay = min(delay * 2, RECONNECT_INTERVAL)
+                try:
+                    await self._close_writer(writer)
+                finally:
+                    current = self.server_connections.get(name)
+                    if current is None or current[1] is writer:
+                        self.server_connections[name] = (None, None, server_def['address'], False, None)
+                        self.handshake_sent[name] = False
+                        self.streams.pop(name, None)
+                        self.processor.reset_source(name)
+            if not self.stopping:
+                event = self.reconnect_events[name]
+                try:
+                    await asyncio.wait_for(event.wait(), min(delay, RECONNECT_INTERVAL) + random.uniform(0, 1))
+                except asyncio.TimeoutError:
+                    pass
+                event.clear()
+                delay = min(delay * 2, RECONNECT_INTERVAL)
+
+    @staticmethod
+    def _single_line(value):
+        """Keep diagnostics on one physical line without terminal control bytes."""
+        if isinstance(value, bytes):
+            return ''.join(chr(byte) if 32 <= byte <= 126 else '\\x%02x' % byte
+                           for byte in value)
+        return TelnetRelay._single_line(str(value).encode('ascii', 'backslashreplace'))
+
+    def _log_spot_decision(self, name, role, line, outputs, delta, history, evaluation=None):
+        evaluated = getattr(self.processor, 'last_evaluation', None) if evaluation is None else evaluation
+        if history:
+            action, reason = 'BYPASS', 'history'
+        elif not self.processor.config['enabled']:
+            action, reason = 'BYPASS', 'processing-off'
+        elif evaluated and evaluated.get('reason'):
+            # Deferred releases intentionally have no new parsed/input count.
+            reason = evaluated['reason']
+            action = 'HOLD' if evaluated.get('held') else ('SELECT' if outputs else 'DROP')
+        elif not delta.get('parsed_spots'):
+            action, reason = 'BYPASS', 'unrecognized-format'
+        elif delta.get('suppressed_repeats'):
+            action, reason = 'DROP', 'repeat'
+        elif delta.get('stale_spots'):
+            action, reason = 'DROP', 'stale'
+        elif delta.get('out_of_order_spots'):
+            action, reason = 'DROP', 'out-of-order'
+        elif delta.get('undated_frequency_conflicts'):
+            action, reason = 'DROP', 'undated-frequency-conflict'
+        else:
+            action = 'SELECT' if outputs else 'DROP'
+            reason = 'frequency-move' if delta.get('frequency_change_updates') else 'new-or-window-expired'
+        fields = ['src=' + self._single_line(name), 'role=' + self._single_line(role),
+                  action, 'reason=' + reason]
+        try:
+            parsed = parse_spot(line, self.processor.clock(), role)
+        except (ValueError, OverflowError):
+            # Bypass/history records must not become parser failures just
+            # because verbose diagnostics are enabled.
+            parsed = None
+        if parsed is not None:
+            fields.append('band=' + parsed.band)
+            if parsed.confidence:
+                fields.append('GC=' + parsed.confidence)
+            if evaluated:
+                fields.append('freq=%.3f%s kHz' % (
+                    parsed.frequency_hz / 1000,
+                    '->%.3f' % (evaluated['frequency_hz'] / 1000)
+                    if evaluated['frequency_hz'] != parsed.frequency_hz else ''))
+                fields.append('freq-basis=' + evaluated.get('frequency_basis', 'input'))
+                if evaluated['call'] != parsed.call:
+                    fields.append('call=' + parsed.call + '->' + evaluated['call'])
+                if evaluated.get('anchor_hz') is not None:
+                    fields.append('anchor=%.3fkHz' % (evaluated['anchor_hz'] / 1000))
+                if evaluated.get('candidate_hz') is not None:
+                    fields.append('candidate=%.3fkHz' % (evaluated['candidate_hz'] / 1000))
+                if 'support' in evaluated:
+                    fields.append('support=%s/%s' % (evaluated['support'], evaluated.get('required', 2)))
+                if evaluated.get('reference_basis'):
+                    fields.append('reference=' + self._single_line(evaluated['reference_basis']))
+                if evaluated.get('call_candidate'):
+                    fields.append('call-candidate=' + self._single_line(evaluated['call_candidate']))
+                if 'call_support' in evaluated:
+                    fields.append('call-support=%s/2' % evaluated['call_support'])
+            if role in ('local', 'rbn', 'gocluster'):
+                rows = self.processor.alignment_snapshot([name])
+                alignment = next((row for row in rows if row['band'] == parsed.band and
+                                  row.get('receiver', parsed.origin) == parsed.origin), None)
+                if alignment:
+                    fields.append('align=' + alignment['state'])
+                    fields.append('samples=%d/%d' % (alignment['samples'], alignment['required']))
+                    fields.append('retained=%s' % alignment.get('retained_samples', alignment['samples']))
+                    if alignment.get('rejection_reason'):
+                        fields.append('align-reason=' + self._single_line(alignment['rejection_reason']))
+                    if alignment['offset_hz'] is not None:
+                        fields.append('adjust=%+.1fHz' % alignment['offset_hz'])
+        if not outputs and (delta.get('frequency_corrections') or delta.get('callsign_corrections')):
+            fields.append('changes=evaluated-only')
+        logging.debug('%-76s | %s', self._single_line(line), ' '.join(fields))
 
     def _build_status_message(self):
-        """Compose a more informative status payload for clients."""
-        uptime = _format_duration(time.time() - self.start_time)
-        client_count = len([w for w in self.client_writers if not w.is_closing()])
-        primary = self.primary_server_name
-        client_timeout = f'{self.client_timeout}s' if self.client_timeout else 'disabled'
-        server_timeout = f'{self.server_timeout}s' if self.server_timeout else 'disabled'
-
-        status_lines = [
-            'Spot Collector Status',
-            f'Uptime: {uptime}',
-            f'Listening on: {self.listen_port}',
-            f'Primary server: {primary}',
-            f'Clients connected: {client_count}',
-            f'Client timeout: {client_timeout}',
-            f'Server timeout: {server_timeout}',
-            '',
-            'Upstream servers:',
-        ]
-
+        """Report spot decisions and current evidence without claiming receipt."""
+        now = time.monotonic()
         rows = []
-        for server_name, address, alive, note, direction, connected_at in self._iter_server_status():
-            state = 'Connected' if alive else 'Disconnected'
-            uptime = _format_duration(time.time() - connected_at) if alive and connected_at else '-'
-            rate = self._compute_rate_per_hour(server_name)
-            rows.append({
-                'name': server_name,
-                'address': address,
-                'state': state,
-                'direction': direction,
-                'rate': rate,
-                'uptime': uptime,
-                'note': note or ''
-            })
+        for source in self.server_definitions:
+            name = source['name']
+            connection = self.server_connections.get(name)
+            alive = bool(connection and connection[3])
+            if not source.get('enabled', True):
+                state = 'Disabled'
+            elif not alive:
+                state = 'Down'
+            else:
+                state = 'Login sent' if self.handshake_sent.get(name) else 'TCP up'
+            last = self.last_spot_times[name]
+            rows.append(dict(self.source_spot_counts[name], name=name,
+                             role=source.get('role', 'cluster' if name == self.primary_server_name else 'local'),
+                             state=state, address=source['address'],
+                             direction=self.server_directions.get(name, source.get('direction', 'both')),
+                             up=_format_duration(max(0, time.time() - connection[4]))
+                                if alive and connection[4] is not None else '-',
+                             last_spot=_format_duration(max(0, now - last)) + ' ago' if last is not None else '-'))
+        snapshot = self.processor.snapshot()
+        local_sources = [source['name'] for source in self.server_definitions
+                         if source.get('role', 'cluster' if source['name'] == self.primary_server_name else 'local') in ('local', 'rbn', 'gocluster')
+                         and source.get('enabled', True)]
+        return format_status(
+            uptime=_format_duration(max(0, time.time() - self.start_time)),
+            listen_port=self.listen_port, primary=self.primary_server_name,
+            client_count=sum(not writer.is_closing() for writer in self.client_writers),
+            client_drops=self.client_drop_count, processing_enabled=self.processor.config['enabled'],
+            counters=snapshot, sources=rows,
+            alignments=self.processor.alignment_snapshot(local_sources),
+            policy=self.processor.config)
 
-        if rows:
-            headers = ('Name', 'Address', 'State', 'Direction', 'Rate/hr', 'Up', 'Note')
-            widths = {
-                'name': len(headers[0]),
-                'address': len(headers[1]),
-                'state': len(headers[2]),
-                'direction': len(headers[3]),
-                'rate': len(headers[4]),
-                'uptime': len(headers[5]),
-                'note': len(headers[6])
-            }
-
-            for row in rows:
-                widths['name'] = max(widths['name'], len(row['name']))
-                widths['address'] = max(widths['address'], len(row['address']))
-                widths['state'] = max(widths['state'], len(row['state']))
-                widths['direction'] = max(widths['direction'], len(row['direction']))
-                widths['rate'] = max(widths['rate'], len(row['rate']))
-                widths['uptime'] = max(widths['uptime'], len(row['uptime']))
-                widths['note'] = max(widths['note'], len(row['note']))
-
-            header_line = (
-                f"{headers[0]:<{widths['name']}}  "
-                f"{headers[1]:<{widths['address']}}  "
-                f"{headers[2]:<{widths['state']}}  "
-                f"{headers[3]:<{widths['direction']}}  "
-                f"{headers[4]:<{widths['rate']}}  "
-                f"{headers[5]:<{widths['uptime']}}  "
-                f"{headers[6]}"
-            )
-            divider_line = (
-                f"{'-' * widths['name']}  "
-                f"{'-' * widths['address']}  "
-                f"{'-' * widths['state']}  "
-                f"{'-' * widths['direction']}  "
-                f"{'-' * widths['rate']}  "
-                f"{'-' * widths['uptime']}  "
-                f"{'-' * widths['note']}"
-            )
-            status_lines.append(header_line)
-            status_lines.append(divider_line)
-
-            for row in rows:
-                status_lines.append(
-                    f"{row['name']:<{widths['name']}}  "
-                    f"{row['address']:<{widths['address']}}  "
-                    f"{row['state']:<{widths['state']}}  "
-                    f"{row['direction']:<{widths['direction']}}  "
-                    f"{row['rate']:<{widths['rate']}}  "
-                    f"{row['uptime']:<{widths['uptime']}}  "
-                    f"{row['note']}"
-                )
-        else:
-            status_lines.append('No upstream servers configured.')
-
-        status_lines.append('')
-        return '\n'.join(status_lines)
+    async def _handle_command(self, writer, line):
+        message = line.strip().lower()
+        local = {b'status': self.send_status_to_single_client,
+                 b'list': self.list_connected_clients, b'uptime': self.send_uptime}
+        if message in local:
+            await local[message](writer)
+            return
+        if message == b'connect':
+            await self.connect_to_all_servers()
+            return
+        for name, (_, upstream, _, alive, _) in list(self.server_connections.items()):
+            if not alive or upstream is None or not self._direction_allows_outbound(name):
+                continue
+            if self.server_definitions_by_name[name].get('role') in ('gocluster', 'rbn'):
+                continue
+            if name == self.primary_server_name and re.match(rb'^(?:sh(?:ow)?)[ /]+dx(?:\s|$|/)', message):
+                # Plain text has no request IDs. Bound the primary-only history
+                # bypass to 200 spot rows / 5 seconds; concurrent live primary
+                # spots during that interval may also bypass repeat suppression.
+                self.history_until = time.monotonic() + 5
+                self.history_remaining = 200
+            await self._write_with_timeout(upstream, line + b'\r\n', 'server ' + name)
 
     async def handle_client(self, reader, writer):
-        """Handle incoming client connections."""
-        client_address = writer.get_extra_info('peername')
-        logging.debug(f'New client connection from {client_address}')
+        if self.stopping or max(len(self.client_handlers), len(self.client_sender_tasks), len(self.cleanup_tasks)) >= 128:
+            writer.close()
+            transport = getattr(writer, 'transport', None)
+            if transport is not None:
+                transport.abort()
+            return
+        handler = asyncio.current_task()
+        self.client_handlers.add(handler)
         self.client_writers.append(writer)
-        self.client_queues[writer] = asyncio.Queue(maxsize=100)
-        sender_task = asyncio.create_task(self._client_sender(writer, self.client_queues[writer], f'client {client_address}'))
-        self.client_sender_tasks[writer] = sender_task
-        self._enable_tcp_keepalive(writer, f'client {client_address}')
-        
+        queue = asyncio.Queue(maxsize=100)
+        self.client_queues[writer] = queue
+        self.client_sender_tasks[writer] = asyncio.create_task(self._client_sender(writer, queue, 'client'))
+        self._enable_tcp_keepalive(writer, 'client')
+        decoder, framer = TelnetDecoder(client_interrupts=True), LineFramer(4096)
         try:
-            await self._enqueue_client(writer, self.login_prompt.encode(), f'client {client_address}')
-            logging.debug(f'Sent login prompt to client {client_address}')
-
-            while True:
-                try:
-                    if self.client_timeout:
-                        data = await asyncio.wait_for(reader.read(1024), timeout=self.client_timeout)
-                    else:
-                        data = await reader.read(1024)
-                    if not data:
-                        logging.debug(f'No more data from client {client_address}')
-                        break
-                    sanitized_data = self._strip_telnet_control(data)
-                    if not sanitized_data:
-                        logging.debug(f'Ignoring Telnet control data from client {client_address}')
-                        continue
-                    message = sanitized_data.decode('utf-8', errors='ignore').strip()
-                    logging.debug(f'Received data from client {client_address}: {message}')
-
-                    if message.lower() == "status":
-                        logging.debug(f'Received "status" command from client {client_address}, sending server status')
-                        await self.send_status_to_single_client(writer)
-                        continue
-
-                    if message.lower() == "connect":
-                        logging.debug(f'Received "connect" command from client {client_address}, reconnecting to all servers')
-                        await self.connect_to_all_servers()
-                        continue
-
-                    if message.lower() == "list":
-                        logging.debug(f'Received "list" command from client {client_address}, sending list of connected clients')
-                        await self.list_connected_clients(writer)
-                        continue
-
-                    if message.lower() == "uptime":
-                        logging.debug(f'Received "uptime" command from client {client_address}, sending server uptime')
-                        await self.send_uptime(writer)
-                        continue
-
-                    for server_name, (_, server_writer, _, alive, _) in list(self.server_connections.items()):
-                        if not alive or not server_writer or server_writer.is_closing():
-                            continue
-                        if not self._direction_allows_outbound(server_name):
-                            continue
-                        ok = await self._write_with_timeout(server_writer, sanitized_data, f'server {server_name}')
-                        if ok:
-                            logging.debug(f'Relayed data from client {client_address} to {server_name}')
-
-                except asyncio.TimeoutError:
-                    logging.debug(f'Client {client_address} inactive for {self.client_timeout} seconds')
+            await self._enqueue_client(writer, self.login_prompt.encode(), 'client')
+            while not self.stopping and not writer.is_closing():
+                data = await asyncio.wait_for(reader.read(4096), self.client_timeout)
+                if not data:
                     break
-
-        except (ConnectionResetError, BrokenPipeError) as e:
-            logging.error(f'Connection to client {client_address} lost: {e}')
+                application, interrupted, _ = decoder.feed(data).partition(b'\x03')
+                for line in framer.feed(application):
+                    await self._handle_command(writer, line)
+                if interrupted:
+                    # Discard an incomplete command and all bytes after Ctrl+C;
+                    # normal cleanup retires only this client's connection.
+                    break
+        except (OSError, asyncio.TimeoutError, ProtocolError):
+            pass
         finally:
-            logging.debug(f'Closing client connection {client_address}')
             await self._cleanup_client(writer)
+            self.client_handlers.discard(handler)
 
     async def list_connected_clients(self, writer):
         """List all currently connected clients."""
@@ -676,51 +752,46 @@ class TelnetRelay:
             connection = self.server_connections.get(server_name)
             address = connection[2] if connection else server_def['address']
             alive = connection[3] if connection else False
-            if not alive:
+            if not alive and server_def.get('enabled', True):
                 logging.debug(f'Server {server_name} is not connected, attempting to reconnect')
                 self._start_connector(server_def, force_restart=True)
 
     async def relay_server_data(self, reader, writer, server_name):
-        """Relay data from server to clients and handle server responses."""
+        source = self.server_definitions_by_name[server_name]
+        decoder, framer = self.streams.setdefault(server_name, (TelnetDecoder(), LineFramer(cluster_prompts=True)))
+        setup_sent = False
+        async def maybe_login(value):
+            if self.handshake_sent.get(server_name) or not login_prompt(value):
+                return
+            identity = source.get('callsign')
+            if not identity:
+                identity = self.callsign if server_name == self.primary_server_name else strip_callsign_suffix(self.callsign)
+            if not await self._write_with_timeout(writer, identity.encode('ascii') + b'\r\n', 'login ' + server_name):
+                raise ConnectionError('Unable to send login to ' + server_name)
+            self.handshake_sent[server_name] = True
         try:
-            while True:
-                data = await asyncio.wait_for(reader.read(1024), timeout=self.server_timeout)
+            while not self.stopping:
+                data = await asyncio.wait_for(reader.read(4096), self.server_timeout)
                 if not data:
-                    logging.debug(f'No more data from server {server_name}')
                     break
-                logging.debug(f'Received data from server {server_name}: {data}')
-                self._record_server_message(server_name)
-
-                lower_chunk = data.lower()
-                prompt_match = re.search(rb'(call|callsign|login)\s*:?', lower_chunk)
-                if prompt_match and not self.handshake_sent.get(server_name):
-                    logging.debug(f'Received login prompt from {server_name}, sending callsign once')
-                    await asyncio.sleep(2)  # 2-second delay for login response
-                    if server_name == self.primary_server_name:
-                        response = f"{self.callsign}\r\n".encode()  # Full callsign for Server1
-                    else:
-                        base_callsign = strip_callsign_suffix(self.callsign)
-                        response = f"{base_callsign}\r\n".encode()  # Stripped callsign for others
-                    await self._write_with_timeout(writer, response, f'server {server_name}')
-                    self.handshake_sent[server_name] = True
-
-                if self._direction_allows_inbound(server_name):
-                    if self._should_apply_rbn(server_name):
-                        await self._process_rbn_data(server_name, data)
-                    else:
-                        for client_writer in self.client_writers[:]:
-                            if client_writer.is_closing():
-                                continue
-                            await self._enqueue_client(client_writer, data, f'client {client_writer.get_extra_info("peername")}')
-                            logging.debug(f'Relayed data from server {server_name} to client')
-
+                for line in framer.feed(decoder.feed(data)):
+                    await maybe_login(line)
+                    if (not setup_sent and self.handshake_sent.get(server_name) and
+                            source.get('ready_text') and source['ready_text'].encode() in line):
+                        for command in source.get('startup_commands', []):
+                            if not await self._write_with_timeout(writer, command.encode() + b'\r\n', 'setup ' + server_name):
+                                return
+                        setup_sent = True
+                    await self._process_server_line(server_name, line)
+                if not self.handshake_sent.get(server_name):
+                    prompt = framer.take_prompt()
+                    if prompt is not None:
+                        await maybe_login(prompt)
+                        if self._direction_allows_inbound(server_name):
+                            await self._deliver_lines_to_clients([prompt])
         except asyncio.TimeoutError:
-            logging.error(f'No data from {server_name} for {self.server_timeout} seconds, reconnecting...')
-        except (ConnectionResetError, BrokenPipeError) as e:
-            logging.error(f'Connection to server {server_name} lost: {e}')
-        finally:
-            logging.debug(f'Closing connection to server {server_name}')
-            self.server_connections[server_name] = (None, None, self.server_connections[server_name][2], False, None)
+            logging.info('Upstream %s idle timeout', server_name)
+        # Connector retains and explicitly closes its writer in every exit path.
 
     async def send_status_to_clients(self):
         """Periodically send connection status to all connected clients."""
@@ -732,56 +803,63 @@ class TelnetRelay:
                         peer = client_writer.get_extra_info('peername')
                         await self._enqueue_client(client_writer, status_message.encode(), f'client {peer}')
                 await asyncio.sleep(STATUS_INTERVAL)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logging.error(f'Status update task failed: {e}, restarting in 5 seconds')
                 await asyncio.sleep(5)
 
-    async def _rbn_flush_loop(self):
-        """Flush RBN dwell queues periodically so late timers still emit."""
-        while True:
-            try:
-                await asyncio.sleep(1)
-                if not self.rbn_aggregator:
-                    continue
-                outputs = self.rbn_aggregator.process_queue()
-                await self._deliver_lines_to_clients(outputs)
-            except Exception as e:
-                logging.error(f'RBN flush loop failed: {e}, restarting in 5 seconds')
-                await asyncio.sleep(5)
+    async def stop(self):
+        self.stopping = True
+        if self.local_call_release_task is not None:
+            self.local_call_release_task.cancel()
+            await asyncio.gather(self.local_call_release_task, return_exceptions=True)
+            self.local_call_release_task = None
+        # Retire spot producers before force-draining, so an already pending
+        # upstream read cannot enqueue a new hold after the final drain.
+        input_tasks = [task for task in self.connector_tasks.values()
+                       if task is not asyncio.current_task()]
+        for task in input_tasks:
+            task.cancel()
+        await asyncio.gather(*input_tasks, return_exceptions=True)
+        # Resolve accepted held work before clients retire. Ordinary shutdown
+        # still does not promise that every queued output reaches a client.
+        await self._drain_local_call_holds(force=True)
+        if self.listener is not None:
+            self.listener.close()
+            await self.listener.wait_closed()
+        tasks = list(self.connector_tasks.values()) + list(self.client_handlers) + list(self.client_sender_tasks.values())
+        for task in tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        await asyncio.gather(*(t for t in tasks if t is not asyncio.current_task()), return_exceptions=True)
+        for writer in self.client_writers[:]:
+            await self._cleanup_client(writer)
+        if self.cleanup_tasks:
+            await asyncio.gather(*list(self.cleanup_tasks), return_exceptions=True)
 
     async def start_relay(self):
-        """Start the relay server and manage all connections."""
-        logging.debug('Starting relay')
-
-        for server_def in self.server_definitions:
-            self.server_connections.setdefault(server_def['name'], (None, None, server_def['address'], False, None))
-            self.server_message_times.setdefault(server_def['name'], deque())
-            self.handshake_sent.setdefault(server_def['name'], False)
-
-        for server_def in self.server_definitions:
-            self._start_connector(server_def)
-
+        self.stopping = False
+        for definition in self.server_definitions:
+            self.server_connections[definition['name']] = (None, None, definition['address'], False, None)
+            if definition.get('enabled', True):
+                self._start_connector(definition)
         status_task = asyncio.create_task(self.send_status_to_clients())
-        if self.rbn_aggregator:
-            self.rbn_timer_task = asyncio.create_task(self._rbn_flush_loop())
-
-        server = await asyncio.start_server(self.handle_client, '0.0.0.0', self.listen_port)
-        logging.debug(f'Relay server started, listening on port {self.listen_port}')
-
+        self.local_call_release_task = asyncio.create_task(self._local_call_release_loop())
         try:
-            async with server:
-                await server.serve_forever()
-        except asyncio.CancelledError:
+            self.listener = await asyncio.start_server(self.handle_client, '0.0.0.0', self.listen_port)
+            async with self.listener:
+                await self.listener.serve_forever()
+        finally:
             status_task.cancel()
-            if self.rbn_timer_task:
-                self.rbn_timer_task.cancel()
-            raise
+            await asyncio.gather(status_task, return_exceptions=True)
+            await self.stop()
 
 if __name__ == "__main__":
     args = parse_arguments()
 
-    configure_logging(args.debug)
-    if args.debug:
+    configure_logging(args.debug or args.debug_verbose)
+    if args.debug or args.debug_verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     else:
         logging.getLogger().setLevel(logging.INFO)
@@ -815,7 +893,13 @@ if __name__ == "__main__":
         if not args.rbn_dedupe:
             logging.warning("--rbn-trace requested but --rbn-dedupe is not enabled")
 
-    relay = TelnetRelay(server_definitions, notes, args.listen_port, args.callsign, args.login_prompt,
-                        client_timeout=client_timeout, server_timeout=server_timeout,
-                        server_directions=server_directions, rbn_config=rbn_config)
-    asyncio.run(relay.start_relay())
+    async def run_configured_relay():
+        # Python 3.7 synchronization primitives bind to the current event loop.
+        # Construct them inside the same loop that owns connections and stop.
+        relay = TelnetRelay(server_definitions, notes, args.listen_port, args.callsign, args.login_prompt,
+                            client_timeout=client_timeout, server_timeout=server_timeout,
+                            server_directions=server_directions, rbn_config=rbn_config,
+                            processing_config=args.spot_processing, debug_verbose=args.debug_verbose)
+        await relay.start_relay()
+
+    asyncio.run(run_configured_relay())

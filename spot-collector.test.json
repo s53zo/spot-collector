@@ -1,0 +1,58 @@
+{
+  "listen_port": 8001,
+  "callsign": "TK0C",
+  "login_prompt": "login: ",
+  "client_timeout": 0,
+  "server_timeout": 0,
+  "debug": true,
+  "debug_verbose": true,
+  "spot_processing": {
+    "enabled": true,
+    "repeat_seconds": 180,
+    "match_tolerance_hz": 500,
+    "move_tolerance_hz": 500,
+    "max_changes": 2
+  },
+  "servers": [
+    {
+      "name": "Server1",
+      "address": "s50dxs.s53m.com:8000",
+      "note": "Existing primary: commands and manual spots",
+      "direction": "both",
+      "role": "cluster"
+    },
+    {
+      "name": "Server2",
+      "address": "telnet.reversebeacon.net:7000",
+      "enabled": false,
+      "note": "RBN feed",
+      "direction": "in",
+      "role": "local"
+    },
+    {
+      "name": "Server3",
+      "address": "192.168.1.43:7300",
+      "note": "Local band skimmer: set the station endpoint",
+      "direction": "in",
+      "enabled": false,
+      "role": "local"
+    },
+    {
+      "name": "Server4",
+      "address": "local-skimmer.example.invalid:7300",
+      "note": "Replace this placeholder before enabling",
+      "enabled": false,
+      "direction": "in",
+      "role": "local"
+    },
+    {
+      "name": "GoCluster",
+      "address": "cluster.n2wq.com:8300",
+      "note": "GoCluster receive-only; login only, preserve server-side settings",
+      "enabled": true,
+      "direction": "in",
+      "role": "gocluster",
+      "callsign": "TK0C"
+    }
+  ]
+}
