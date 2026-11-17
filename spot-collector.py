@@ -11,7 +11,7 @@ import socket
 import time
 
 from spot_processing import SpotProcessor, parse_spot
-from status_report import format_status
+from status_report import format_status, format_short_status
 from stream_protocol import LineFramer, TelnetDecoder, ProtocolError, login_prompt, encode_telnet
 
 RECONNECT_INTERVAL = 300  # 5 minutes max delay for reconnect attempts
@@ -633,7 +633,7 @@ class TelnetRelay:
             fields.append('changes=evaluated-only')
         logging.debug('%-76s | %s', self._single_line(line), ' '.join(fields))
 
-    def _build_status_message(self):
+    def _build_status_message(self, long=False):
         """Report spot decisions and current evidence without claiming receipt."""
         now = time.monotonic()
         rows = []
@@ -659,18 +659,20 @@ class TelnetRelay:
         local_sources = [source['name'] for source in self.server_definitions
                          if source.get('role', 'cluster' if source['name'] == self.primary_server_name else 'local') in ('local', 'rbn', 'gocluster')
                          and source.get('enabled', True)]
-        return format_status(
+        formatter = format_status if long else format_short_status
+        return formatter(
             uptime=_format_duration(max(0, time.time() - self.start_time)),
             listen_port=self.listen_port, primary=self.primary_server_name,
             client_count=sum(not writer.is_closing() for writer in self.client_writers),
             client_drops=self.client_drop_count, processing_enabled=self.processor.config['enabled'],
             counters=snapshot, sources=rows,
-            alignments=self.processor.alignment_snapshot(local_sources),
+            alignments=self.processor.alignment_snapshot(local_sources) if long else [],
             policy=self.processor.config)
 
     async def _handle_command(self, writer, line):
         message = line.strip().lower()
         local = {b'status': self.send_status_to_single_client,
+                 b'longstatus': self.send_longstatus_to_single_client,
                  b'list': self.list_connected_clients, b'uptime': self.send_uptime}
         if message in local:
             await local[message](writer)
@@ -744,6 +746,9 @@ class TelnetRelay:
         status_message = self._build_status_message()
         peer = writer.get_extra_info('peername')
         await self._enqueue_client(writer, status_message.encode(), f'client {peer}')
+
+    async def send_longstatus_to_single_client(self, writer):
+        await self._enqueue_client(writer, self._build_status_message(long=True).encode(), 'longstatus client')
 
     async def connect_to_all_servers(self):
         """Attempt to reconnect to all servers that are currently not connected."""

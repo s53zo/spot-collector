@@ -52,7 +52,7 @@ class ReportingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await r._process_server_line('local', line())
             self.assertFalse(debug.called)
         before = r.processor.snapshot()
-        report = r._build_status_message()
+        report = r._build_status_message(long=True)
         self.assertEqual(r.processor.snapshot(), before)
         for expected in ('Spot flow', 'Selected: 1', 'Repeats suppressed: 1',
                          'Receiver frequency alignment', 'Feeds', 'Login sent', 'local'):
@@ -147,7 +147,7 @@ class ReportingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         queue = r.client_queues[client]
         self.assertEqual(queue.get_nowait(), first + b'\r\n')
         self.assertTrue(queue.empty())
-        report = r._build_status_message()
+        report = r._build_status_message(long=True)
         self.assertIn('Confirmed 0', report)
         self.assertIn('Receiver frequency alignment', report)
         self.assertIn('IZ3EAW', report)

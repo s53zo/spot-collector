@@ -198,3 +198,29 @@ def format_status(*, uptime, listen_port, primary, client_count, client_drops,
         'Last spot reports source activity, including activity while processing is bypassed.',
     ])
     return '\n'.join(lines) + '\n'
+
+
+def format_short_status(*, uptime, listen_port, primary, client_count, client_drops,
+                        processing_enabled, counters, sources, alignments, policy):
+    """Compact periodic/client overview; detailed diagnostics use longstatus."""
+    enabled = [source for source in sources if source.get('state') != 'Disabled']
+    up = sum(source.get('state') in ('TCP up', 'Login sent') for source in enabled)
+    down = ', '.join(_plain(source.get('name')) for source in enabled
+                     if source.get('state') == 'Down')
+    if len(down) > 80:
+        down = down[:77] + '...'
+    def count(key):
+        return _count(counters.get(key, 0))
+    return '\n'.join([
+        'Spot Collector | Up %s | Port %s | Clients %s | %s' %
+        (_plain(uptime), _plain(listen_port), _count(client_count),
+         'Processing ON' if processing_enabled else 'Processing OFF'),
+        'Feeds TCP up: %d/%d%s' % (up, len(enabled), ' | Down: ' + down if down else ''),
+        'Spots: parsed %s | selected %s | repeats %s' %
+        (count('parsed_spots'), count('delivered_spots'), count('suppressed_repeats')),
+        'Changes evaluated: freq %s | calls %s | holds now %s | queue drops %s' %
+        (count('frequency_corrections'), count('callsign_corrections'),
+         count('current_local_call_holds'), _count(client_drops)),
+        'Totals since startup; selected is not receipt. Type longstatus for details.',
+        '',
+    ])

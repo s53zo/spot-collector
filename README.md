@@ -240,7 +240,7 @@ the existing reconnect backoff instead of waiting indefinitely for input.
 login prompt is a compatibility prompt, not client authentication. Run the
 listener only in the intended trusted network.
 
-Local commands are `status`, `list`, `uptime`, and `connect`. They are handled
+Local commands are `status`, `longstatus`, `list`, `uptime`, and `connect`. They are handled
 as complete lines; ordinary commands go to outbound-enabled upstreams. All
 clients share upstream state.
 Client Ctrl+C (raw ETX or Telnet Interrupt Process) disconnects that client
@@ -250,7 +250,9 @@ remaining bytes are discarded, and the interrupt is never forwarded upstream.
 
 ### Spot-focused status
 
-`status` and the periodic report show:
+`status` and periodic broadcasts provide a five-line overview: uptime, clients,
+feed availability, spot totals, evaluated corrections and queue drops.
+`longstatus` returns the detailed report, including:
 
 - Parsed spots, selected output, suppressed repeats and rejected input.
 - Frequency/callsign changes and admitted frequency-move updates.
