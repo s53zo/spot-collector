@@ -59,7 +59,18 @@ added. Diagnostics belong to Collector status/logging, not spot comments.
 
 ### Corroboration and per-receiver frequency adjustment
 
-The first spot remains immediate. A new frequency more than the configured
+When two distinct skimmer receiver bases have reported the same CW call in
+the last 180 seconds, a different skimmer call within 100 Hz needs a second
+receiver of its own. The two reports of the incumbent must also agree within
+100 Hz. A second receiver confirming the newcomer allows it through under
+its own callsign. An unconfirmed report expires silently. This also applies
+to merged feeds that carry CW spots with a structured dB report. Human spots
+with ordinary comments, other modes and clear frequencies keep their usual
+admission rules. Adjust the radius and lifetime with `cw_conflict_hz` and
+`cw_conflict_seconds`. A genuine station heard by only one skimmer close to
+an established run can be withheld during this window.
+
+The first spot on a clear frequency remains immediate. A new frequency more than the configured
 movement tolerance from the delivered anchor becomes pending. The default
 candidate window is 10 seconds and an agreeing pair/group must fit within a
 100-Hz spread. A second distinct receiver confirms the proposal; a repeated
@@ -133,8 +144,8 @@ frequency indexes instead of sweeping every retained spot for every input.
 
 ### Local-skimmer callsign quality
 
-Only `local` inputs use local busted-call checking. Public `rbn`, ordinary
-cluster and GoCluster lines keep their existing external processing policy.
+Only `local` inputs qualify for callsign replacement. CW skimmer reports on
+every input use the occupied-frequency check above.
 Normalize calls to uppercase; a replacement must differ by exactly one inserted,
 deleted or substituted character. Transpositions do not qualify. Reported and replacement calls must both have more than three characters. Portable calls containing a slash are excluded from automatic replacement in
 this initial implementation; do not strip their prefix or suffix to force an

@@ -102,6 +102,7 @@ def format_status(*, uptime, listen_port, primary, client_count, client_drops,
         '  Correction unavailable: %s | Selected frequency moves: %s' %
         (count('correction_unavailable'), count('frequency_change_updates')),
         '  Correction counts can include spots subsequently suppressed as repeats.',
+        '  CW reports held for a competing callsign: %s' % count('cw_conflicts_held'),
         '  Local call checks: held now %s | Held %s | Corrected %s | Released %s' %
         (count('current_local_call_holds'), count('local_call_held'),
          count('local_call_corrected'), count('local_call_released')),

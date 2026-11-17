@@ -14,6 +14,8 @@
     "corroboration_seconds": 10,
     "corroboration_tolerance_hz": 100,
     "calibration_match_tolerance_hz": 1000,
+    "cw_conflict_seconds": 180,
+    "cw_conflict_hz": 100,
     "local_call_hold_seconds": 3,
     "local_call_tolerance_hz": 200
   },

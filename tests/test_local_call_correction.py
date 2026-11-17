@@ -101,8 +101,10 @@ class LocalCallCorrectionTests(unittest.TestCase):
         self.engine = SpotProcessor(clock=lambda:self.now)
         for role, source, origin in [('local','other-local','A1AAA'),('local','third-local','B1BBB')]:
             self.engine.process(source,role,self.raw('S53M',7010,origin))
-        raw, output = self.local()
-        self.assertEqual(output,[raw])
+        _, output = self.local()
+        self.assertEqual(output, [])
+        self.assertEqual(self.engine.last_evaluation['call'], 'S53MM')
+        self.assertEqual(self.engine.last_evaluation['reason'], 'cw-conflict-unconfirmed')
         self.assertEqual(self.engine.snapshot()['current_local_call_holds'],0)
 
     def test_unrelated_first_local_and_external_inputs_do_not_hold(self):

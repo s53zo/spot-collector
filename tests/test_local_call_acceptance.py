@@ -46,6 +46,9 @@ class LocalCallAcceptanceTests(unittest.TestCase):
     def test_external_and_short_call_never_enter_local_correction(self):
         self.reference(); self.reference(origin='F1AAA',role='cluster')
         raw=line('S53MM',7010.1,origin='R1AAA')
-        self.assertEqual(self.p.process('public','rbn',raw),[raw])
+        self.assertEqual(self.p.process('public','rbn',raw), [])
+        self.assertEqual(self.p.last_evaluation['call'], 'S53MM')
         short=line('S5M',7010.1,origin='TK0C-1')
-        self.assertEqual(self.p.process('local','local',short),[short])
+        self.assertEqual(self.p.process('local','local',short), [])
+        self.assertEqual(self.p.last_evaluation['call'], 'S5M')
+        self.assertEqual(self.p.last_evaluation['reason'], 'cw-conflict-unconfirmed')

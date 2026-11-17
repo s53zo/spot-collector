@@ -466,6 +466,7 @@ class TelnetRelay:
         for field, counter in (('parsed', 'parsed_spots'), ('forwarded', 'delivered_spots'),
                                ('repeats', 'suppressed_repeats'), ('held', 'local_call_held')):
             metrics[field] += delta.get(counter, 0)
+        metrics['held'] += delta.get('cw_conflicts_held', 0)
         metrics['rejected'] += sum(delta.get(key, 0) for key in
                                   ('stale_spots', 'out_of_order_spots', 'undated_frequency_conflicts'))
         is_spot = bool(re.match(rb'^DX\s+de\s', line, re.I))
@@ -611,6 +612,8 @@ class TelnetRelay:
                     fields.append('candidate=%.3fkHz' % (evaluated['candidate_hz'] / 1000))
                 if 'support' in evaluated:
                     fields.append('support=%s/%s' % (evaluated['support'], evaluated.get('required', 2)))
+                if evaluated.get('occupant'):
+                    fields.append('occupant=' + self._single_line(evaluated['occupant']))
                 if evaluated.get('reference_basis'):
                     fields.append('reference=' + self._single_line(evaluated['reference_basis']))
                 if evaluated.get('call_candidate'):

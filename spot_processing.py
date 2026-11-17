@@ -27,6 +27,7 @@ DEFAULTS = {
     'calibration_max_slope_ppm': 5, 'calibration_uncertainty_hz': 50,
     'corroboration_seconds': 10, 'corroboration_tolerance_hz': 100,
     'calibration_match_tolerance_hz': 1000, 'calibration_retry_batch': 16,
+    'cw_conflict_seconds': 180, 'cw_conflict_hz': 100,
     'local_call_hold_seconds': 3, 'local_call_tolerance_hz': 200,
     'max_entries': 4096,
 }
@@ -62,6 +63,7 @@ class ParsedSpot:
     freq_span: tuple
     call_span: tuple
     receiver_base: str = ''
+    cw_skimmer: bool = False
 
     def __post_init__(self):
         # A property of this immutable record, not a process-global identity cache.
@@ -131,9 +133,12 @@ def parse_spot(line, now, role='cluster'):
         conf = re.search(rb' ([?SPVCB]) ([0-2][0-9][0-5][0-9]Z)$', line)
         if conf:
             confidence = conf.group(1).decode('ascii')
-    return ParsedSpot(line, receiver_identity(match.group('origin').decode('ascii')),
+    origin = match.group('origin').decode('ascii').upper()
+    # Merged feeds can strip the -# suffix but retain the structured CW dB field.
+    cw_skimmer = mode == 'CW' and (role in ('local', 'rbn') or origin.endswith('-#') or report is not None)
+    return ParsedSpot(line, receiver_identity(origin),
                       call, frequency * 1000, band, mode, report, observed,
-                      confidence, match.span('freq'), match.span('call'))
+                      confidence, match.span('freq'), match.span('call'), cw_skimmer=cw_skimmer)
 
 
 @dataclass
@@ -151,6 +156,14 @@ class Repeat:
     frequency: float
     changes: int = 0
     generation: float = -1
+
+
+@dataclass
+class CwConflict:
+    at: float
+    frequency: float
+    occupant: str
+    source: str
 
 
 @dataclass
@@ -311,6 +324,14 @@ class SpotProcessor:
         observation_groups['owner'] = lambda key, obs: (obs.source, obs.spot.origin, obs.spot.band)
         self.measurements = _IndexedStore(limit, self.config['pair_window_seconds'],
                                          lambda obs: obs.at, observation_groups)
+        cw_indexes = {name: observation_groups[name] for name in ('source', 'frequency')}
+        self.cw_reports = _IndexedStore(limit, self.config['cw_conflict_seconds'],
+                                        lambda obs: obs.at, cw_indexes, inclusive=True)
+        self.cw_conflicts = _IndexedStore(limit, self.config['cw_conflict_seconds'],
+                                         lambda hold: hold.at, {
+                                             'call': lambda key, hold: key[:2],
+                                             'source': lambda key, hold: hold.source,
+                                         }, inclusive=True)
         self.votes = _IndexedStore(limit, self.config['corroboration_seconds'],
                                   lambda obs: obs.at, observation_groups, inclusive=True)
         self.pending = _IndexedStore(limit, self.config['corroboration_seconds'],
@@ -341,7 +362,8 @@ class SpotProcessor:
     def _prune(self, now):
         backwards = self._last_prune is not None and now < self._last_prune
         for store in (self.references, self.locals, self.samples, self.repeats,
-                      self.local_origins, self.latest, self.measurements, self.votes, self.rejection, self.calibration_retry):
+                      self.local_origins, self.latest, self.measurements, self.votes, self.rejection,
+                      self.calibration_retry, self.cw_reports, self.cw_conflicts):
             store.prune(now, backwards)
         before = len(self.pending)
         self.pending.prune(now, backwards)
@@ -358,7 +380,7 @@ class SpotProcessor:
     def reset_source(self, source_id):
         """Connection epochs invalidate their measurements and dependent alignment."""
         for store in (self.references, self.locals, self.measurements, self.votes,
-                      self.pending, self.rejection):
+                      self.pending, self.rejection, self.cw_reports, self.cw_conflicts):
             for key in list(store.keys_for('source', source_id)):
                 del store[key]
         for key, sample in list(self.samples.items()):
@@ -367,6 +389,7 @@ class SpotProcessor:
         self.calibration_retry.clear()
         for hold in self.local_call_holds.values():
             if hold.observation.source == source_id:
+                hold.deadline = min(hold.deadline, self.clock())
                 hold.force_original = True
         self.counts['source_resets'] += 1
 
@@ -637,6 +660,55 @@ class SpotProcessor:
             return None
         return center
 
+    def _fresh_cw(self, obs, now):
+        window = self.config['cw_conflict_seconds']
+        stamp = obs.spot.observed_at
+        return (stamp is not None and 0 <= now - obs.at < window and
+                0 <= now - stamp < window + 60 and
+                now - stamp <= self.config['max_age_seconds'])
+
+    def _cw_confirmed_by(self, spot, other):
+        return (other.cw_skimmer and other.call == spot.call and other.band == spot.band and
+                other.receiver_base != spot.receiver_base and
+                abs(spot.frequency_hz - other.frequency_hz) <= self.config['cw_conflict_hz'] and
+                abs(spot.observed_at - other.observed_at) < self.config['cw_conflict_seconds'] + 60)
+
+    def _cw_conflict(self, obs, frequency, now, before):
+        """Find a corroborated occupant, unless a second receiver backs this call."""
+        spot = obs.spot
+        tolerance = self.config['cw_conflict_hz']
+        by_call = {}
+        # Timestamps on the wire have minute precision. Check both that clock
+        # and receipt time so delayed copies cannot renew an old occupation.
+        can_confirm = self._fresh_cw(obs, now)
+        for other in self._nearby(self.cw_reports, replace(spot, frequency_hz=frequency), tolerance):
+            ref = other.spot
+            if ((before is not None and other.at >= before) or
+                    not self._fresh_cw(other, now) or
+                    abs(ref.frequency_hz - frequency) > tolerance):
+                continue
+            if ref.call == spot.call:
+                if can_confirm and self._cw_confirmed_by(spot, ref):
+                    return None
+            else:
+                by_call.setdefault(ref.call, []).append((ref.frequency_hz, ref.receiver_base))
+        # Once held, a repeat from the same receiver cannot slip through if
+        # the incumbent ages out first. Mirrors never extend this deadline.
+        identity = (spot.band, spot.call)
+        for hold in self.cw_conflicts.values_for('call', identity):
+            if abs(hold.frequency - frequency) <= tolerance:
+                return hold.occupant
+        for call, reports in by_call.items():
+            # In frequency order, a qualifying pair contains an adjacent
+            # change of receiver. Two mirrors or SSIDs share a receiver base.
+            reports.sort()
+            for (lower, first), (upper, second) in zip(reports, reports[1:]):
+                if first != second and upper - lower <= tolerance:
+                    self._put(self.cw_conflicts, identity + (frequency,),
+                              CwConflict(obs.at, frequency, call, obs.source))
+                    return call
+        return None
+
     def _movement(self, obs, call, frequency, previous, now):
         identity = (call, obs.spot.band, obs.spot.mode)
         votes = [self.votes[key] for key in self.votes.keys_for('identity', identity)
@@ -736,11 +808,11 @@ class SpotProcessor:
                 frequency -= offset
             group, reason, _, _ = self._local_call_decision(obs, frequency, now, before=cutoff)
             force_original = hold.force_original or due and group is None
-            if due and force_original:
+            if due and force_original and not hold.force_original:
                 self.counts['local_call_expired'] += 1
             outputs = self._select_output(obs, now, allow_hold=False,
                                           force_original=force_original, reference_before=cutoff)
-            if self.last_evaluation.get('call') == spot.call:
+            if self.last_evaluation.get('call') == spot.call and not self.last_evaluation.get('held'):
                 self.last_evaluation['reason'] = ('local-call-reset' if hold.force_original
                                                    else 'local-call-timeout' if due else reason)
         delta = {counter: value-before.get(counter, 0) for counter, value in self.counts.items()}
@@ -832,6 +904,8 @@ class SpotProcessor:
         if spot.observed_at is not None:
             self._put(self.latest, identity, obs)
         key = (source_id, spot.origin, spot.call, spot.band, spot.mode)
+        if spot.cw_skimmer and spot.observed_at is not None:
+            self._put(self.cw_reports, key, obs)
         self._put(self.measurements, key, obs)
         self._put(self.votes, key, obs)
         if role in ('local', 'rbn'):
@@ -941,6 +1015,16 @@ class SpotProcessor:
             for pending_key in list(self.pending.keys_for('identity', (spot.call, spot.band, spot.mode))):
                 del self.pending[pending_key]
         else:
+            if spot.cw_skimmer and call == spot.call:
+                occupant = self._cw_conflict(obs, frequency, now, reference_before)
+                if occupant is not None:
+                    self.counts['cw_conflicts_held'] += 1
+                    self.last_evaluation.update(reason='cw-conflict-unconfirmed', held=True,
+                                                occupant=occupant, support=int(spot.observed_at is not None))
+                    return []
+            if spot.mode == 'CW':
+                for key in list(self.cw_conflicts.keys_for('call', (spot.band, call))):
+                    del self.cw_conflicts[key]
             self._put(self.repeats, repeat_key, Repeat(now, spot.observed_at, frequency))
             self.last_evaluation['reason'] = 'new-or-window-expired'
         self.counts['delivered_spots'] += 1
